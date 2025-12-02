@@ -1,8 +1,7 @@
 import sqlite3
 import numpy as np
 from typing import Tuple
-
-DB_PATH = "fpl.db"
+from config import DB_PATH
 
 def get_player_data(player_id: int) -> dict:
     conn = sqlite3.connect(DB_PATH)

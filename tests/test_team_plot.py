@@ -3,8 +3,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-DB_PATH = "fpl.db"
+from config import DB_PATH
 
 def get_player_data(pid):
     conn = sqlite3.connect(DB_PATH)
