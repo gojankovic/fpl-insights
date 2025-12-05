@@ -8,14 +8,13 @@ from utils.ai_service import (
     freehit_advice
 )
 
-
 def run_h2h(args):
     result = h2h_prediction(
         entry_a=args.teamA,
         entry_b=args.teamB,
         gw=args.gw
     )
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 def run_captaincy(args):
@@ -23,7 +22,7 @@ def run_captaincy(args):
         entry_id=args.team,
         gw=args.gw
     )
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 def run_transfers(args):
@@ -32,16 +31,16 @@ def run_transfers(args):
         gw=args.gw,
         candidate_pool_size=args.pool
     )
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 def run_freehit(args):
     result = freehit_advice(
         gw=args.gw,
-        candidate_pool_size=args.pool,
-        budget=args.budget
+        budget=args.budget,
+        pool_size=args.pool
     )
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 def main():
@@ -82,11 +81,11 @@ def main():
     # -------------------------------
     # FREEHIT
     # -------------------------------
-    p_fh = sub.add_parser("freehit", help="AI Free Hit squad builder")
-    p_fh.add_argument("--gw", type=int, required=True)
-    p_fh.add_argument("--pool", type=int, default=120)
-    p_fh.add_argument("--budget", type=float, default=100.0)
-    p_fh.set_defaults(func=run_freehit)
+    fh = sub.add_parser("freehit", help="AI Free Hit squad builder")
+    fh.add_argument("--gw", type=int, required=True)
+    fh.add_argument("--pool", type=int, default=150)
+    fh.add_argument("--budget", type=float, default=100.0)
+    fh.set_defaults(func=run_freehit)
 
 
     # -------------------------------

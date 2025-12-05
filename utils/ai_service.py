@@ -4,20 +4,24 @@ from typing import Dict, Any, List, Optional
 from utils.ai_data_builder import (
     load_team_json,
     build_squad_for_gw,
+    build_team_json,
+    build_squad_state,
     build_candidate_pool,
+    reduce_candidate_pool_for_transfers,
 )
 from utils.ai_predictor import (
     predict_h2h,
     advise_captaincy,
-    recommend_transfers,
-    recommend_freehit_squad,
+    build_transfer_prompt, build_freehit_prompt,
 )
+
+from utils.ai_predictor import ask_llm
+from utils.ai_service_helpers import sanitize_llm_transfer_output
 
 
 # -------------------------------------------------
 # AI SERVICE LAYER — clean and simple public API
 # -------------------------------------------------
-
 
 # -------------------------------------------------
 # 1) H2H PREDICTION
@@ -67,57 +71,76 @@ def captaincy_advice(entry_id: int, gw: int) -> Dict[str, Any]:
 # 3) TRANSFER ADVICE
 # -------------------------------------------------
 
-def transfer_advice(entry_id: int, gw: int,
-                    candidate_pool_size: int = 60) -> Dict[str, Any]:
+def transfer_advice(entry_id: int, gw: int, candidate_pool_size: int = 120):
     """
-    AI transfer advisor.
-    Uses last completed GW before target GW.
+    Main transfer advisor.
+    Assembles dataset → reduces candidate pool → builds prompt → queries LLM → validates response.
     """
-    team_json = load_team_json(entry_id)
-    squad = build_squad_for_gw(entry_id, gw)
 
-    # Determine budget state from last GW before target
-    use_gw = squad[0]["last_gw_used"]
-    last_gw_block = next(g for g in team_json["gw_data"] if g["gw"] == use_gw)
+    # Build data sources
+    team_json = build_team_json(entry_id)
+    squad_state = build_squad_state(entry_id, gw)
+    pool_full = build_candidate_pool(limit=candidate_pool_size, gw=gw)
+    pool_reduced = reduce_candidate_pool_for_transfers(squad_state, pool_full)
 
-    squad_state = {
-        "bank": last_gw_block["bank"],
-        "free_transfers": last_gw_block["transfers"],
-        "squad_players": squad,
-        "source_gw": use_gw
-    }
+    # Build prompt
+    prompt = build_transfer_prompt(gw, team_json, squad_state, pool_reduced)
 
-    candidate_pool = build_candidate_pool(limit=candidate_pool_size)
+    # Ask LLM
+    response = ask_llm(prompt)
 
-    print(f"[AI] Transfer advice for GW{gw}, using GW{use_gw} squad & bank data.")
+    if response["error"]:
+        return {
+            "error": response["error"],
+            "raw": response["raw"]
+        }
 
-    return recommend_transfers(gw, team_json, squad_state, candidate_pool)
+    llm_json = response["json"]
+
+    # Validate!
+    sanitized = sanitize_llm_transfer_output(llm_json, squad_state, pool_reduced)
+
+    return sanitized
 
 
 # -------------------------------------------------
 # 4) FREE HIT ADVICE
 # -------------------------------------------------
-def freehit_advice(gw: int,
-                   candidate_pool_size: int = 120,
-                   budget: float = 100.0) -> Dict[str, Any]:
+def freehit_advice(gw: int, budget: float, pool_size: int = 150):
+    """
+    Free Hit AI builder:
+    - Does NOT depend on user's existing team.
+    - Builds full 15-man squad from scratch.
+    """
+    # Build candidate pool
+    pool = build_candidate_pool(limit=pool_size, gw=gw)
 
-    candidate_pool = build_candidate_pool(limit=candidate_pool_size)
+    # Create simple FH state
+    fh_state = {
+        "target_gw": gw,
+        "budget": budget,
+        "max_from_club": 3,
+        "requirements": {
+            "GK": 2,
+            "DEF": 5,
+            "MID": 5,
+            "FWD": 3
+        }
+    }
 
-    print(f"[AI] Free Hit team generation for GW{gw} using {candidate_pool_size} candidates.")
+    print(f"[AI] Building Free Hit squad for GW{gw} with budget £{budget}m.")
 
-    result = recommend_freehit_squad(gw, candidate_pool, budget)
+    prompt = build_freehit_prompt(gw, fh_state, pool)
+    resp = ask_llm(prompt)
 
-    # ---------- VALIDATION ----------
-    errors = validate_freehit_squad(result["squad"])
-    if errors:
+    # If LLM failed completely
+    if isinstance(resp, dict) and resp.get("error"):
         return {
-            "error": "Invalid squad returned by AI.",
-            "issues": errors,
-            "ai_output": result
+            "error": resp["error"],
+            "raw_response": resp.get("raw")
         }
 
-    return result
-
+    return resp
 
 
 # -------------------------------------------------

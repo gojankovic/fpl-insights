@@ -21,48 +21,58 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # -------------------------------------------------
 # LOW-LEVEL LLM WRAPPER
 # -------------------------------------------------
-
 def ask_llm(prompt: str) -> Dict[str, Any]:
     """
-    Sends prompt to LLM and safely parses JSON.
-    Handles cases where model returns ```json ... ``` blocks.
+    Sends a prompt to the LLM and extracts JSON safely.
+    Supports markdown fences like ```json ... ```
+    Returns:
+      {
+        "raw": str,
+        "json": dict | None,
+        "error": str | None
+      }
     """
-
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5-mini",
         messages=[
             {"role": "system", "content": "You are an expert FPL analyst. Always output strict JSON."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.3,
     )
 
     raw = response.choices[0].message.content.strip()
 
-    # Remove ```json ... ```
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        raw = raw.replace("json", "", 1).strip()
+    # Step 1: extract JSON block from markdown fences
+    if "```" in raw:
+        parts = raw.split("```")
+        # find any part that looks like JSON
+        for part in parts:
+            part = part.strip()
+            if part.startswith("{") and part.endswith("}"):
+                raw = part
+                break
 
-    # Attempt to parse JSON
+    # Step 2: fallback — find first "{" and last "}"
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = raw[start:end + 1]
+    else:
+        return {"raw": raw, "json": None, "error": "No JSON object found in response."}
+
+    # Step 3: decode JSON
     try:
-        parsed = json.loads(raw)
-        return parsed
-    except json.JSONDecodeError:
-        return {
-            "error": "Model returned non-JSON response.",
-            "raw_response": raw
-        }
+        parsed = json.loads(candidate)
+        return {"raw": raw, "json": parsed, "error": None}
+    except json.JSONDecodeError as e:
+        return {"raw": raw, "json": None, "error": f"JSON decode error: {e}"}
 
 
 # -------------------------------------------------
-# BASIC (već dogovoreno): whole-team / player / compare
+# BASIC
 # -------------------------------------------------
 
 def build_team_prompt(team_json: Dict[str, Any]) -> str:
-    """
-    Generic prompt za analizu jednog tima kroz celu sezonu.
-    """
     return f"""
 You are an expert Fantasy Premier League analyst.
 
@@ -369,59 +379,90 @@ def advise_captaincy(
 # -------------------------------------------------
 # AI TRANSFER RECOMMENDER
 # -------------------------------------------------
-
-def build_transfer_prompt(
-    gw: int,
-    current_team: Dict[str, Any],
-    squad_state: Dict[str, Any],
-    candidate_pool: List[Dict[str, Any]],
-) -> str:
+def build_transfer_prompt(gw, current_team, squad_state, candidate_pool):
     """
-    squad_state:
-    {
-      "bank": float,
-      "free_transfers": int,
-      "squad_players": [... same_player_structure as above ...]
-    }
-
-    candidate_pool:
-    lista kandidata iz baze (već prefiltriranih Python kodom):
-    [
-      {
-        "id": ...,
-        "name": ...,
-        "team": "ARS",
-        "pos": "MID",
-        "price": 7.5,
-        "recent_history": [... last 4-6 GWs from player_history ...]
-      },
-      ...
-    ]
+    Final, optimized transfer prompt.
+    All comments are removed inside the string so the model does not get distracted.
     """
+
     return f"""
-You are an FPL transfer advisor.
+You are an advanced FPL transfer analyst. 
+Your task is to propose realistic, rules-accurate transfers for Gameweek {gw}.
 
-You will receive:
-- current TEAM JSON (season context),
-- squad_state (players currently owned, free transfers, money in the bank),
-- candidate_pool: a pre-filtered list of good players from the whole game.
+============================================================
+DATA AVAILABLE (DO NOT INVENT DATA)
+============================================================
+TEAM JSON  → season context, value, bank, transfers, fixtures.
+SQUAD STATE → players owned, minutes, form, positional info, club counts.
+CANDIDATE POOL → best available players with stats.
 
-Gameweek of interest: GW {gw}.
+Use ONLY these data sources.
 
-RULES:
-- Use ONLY the provided JSON data.
-- Assume standard FPL rules: 15 players, 1 free transfers usual, minus 4 for extra.
-- Focus on upgrading weak spots (injured/out-of-form players)
-  to in-form players from the candidate_pool.
-- Respect budget (price difference + bank).
-- Do NOT suggest wild unrealistic -12 hits by default; keep it reasonable.
+============================================================
+STRICT FPL RULES YOU MUST OBEY
+============================================================
 
-TASK:
-Suggest 0-1 transfers (or more if team have more free transfers than 1, usually no more than 2 because if team have 1 fts minus 4 for every extra transfers), 
-unless the squad_state explicitly shows more FTs.
-Explain briefly why.
+BUDGET
+- incoming_player.price ≤ outgoing_player.price + squad_state.bank
 
-Respond STRICTLY with JSON:
+POSITION MATCHING
+- GK→GK
+- DEF→DEF
+- MID→MID
+- FWD→FWD
+
+CLUB LIMIT
+- After transfers: max 3 players per club.
+- Use squad_state["club_counts"] to check limits.
+
+OWNERSHIP RULE
+- Never buy players already owned (use squad_state["squad"])
+
+TRANSFER COUNT LOGIC
+- If squad_state.free_transfers = 1 → normally suggest 1 transfer.
+- You MAY suggest 2 transfers (-4 hit) if needed to afford a clearly superior improvement.
+- Never propose more than 2 transfers.
+- Never exceed a -4 hit.
+
+SELL LOGIC (valid reasons to sell):
+- poor recent form (low recent_form)
+- low expected_minutes
+- rotation risk ("rotation_risk" = "medium" or "high")
+- suspension flag = true
+- injury flag = true
+- significantly worse upcoming fixtures (higher fdr_next5.avg_fdr)
+- obvious downgrade compared to available alternatives at same price bracket
+
+BUY LOGIC (valid reasons to buy):
+- strong recent_form (clear trend across last 3–5 matches)
+- expected_minutes ≥ 60
+- nailed starter (rotation_risk = "low")
+- good upcoming fixtures (low fdr_next5.avg_fdr)
+- excellent value for price
+- fits budget and positional structure
+- improves team long-term
+
+FIXTURE LOGIC (CRITICAL)
+Use fdr_next5.avg_fdr:
+- Lower avg_fdr = easier fixtures
+Compare outgoing vs incoming fixtures:
+- Prefer players with better next 3–5 GWs unless form strongly contradicts.
+
+INJURY / SUSPENSION RULE
+- Never call a player "injured" unless SQUAD STATE or CANDIDATE POOL explicitly shows "injury": true.
+- If minutes = 0 but "injury" is false → treat neutrally (rest/rotation/suspension).
+- If "suspended" = true → treat as suspension.
+
+STYLE RULES
+- Explanations must be short, clean, professional.
+- Use plain UTF-8. Do not use escaped unicode or escaped symbols.
+- Names like "Marcos Senesi Barón" must appear exactly as written.
+
+============================================================
+OUTPUT FORMAT (STRICT JSON ONLY)
+============================================================
+
+Return EXACTLY this structure:
 
 {{
   "gameweek": {gw},
@@ -431,100 +472,82 @@ Respond STRICTLY with JSON:
       "out_name": "string",
       "in_id": int,
       "in_name": "string",
-      "reason": "short explanation"
+      "reason": "clear, short explanation"
     }}
   ],
-  "hit_cost": 0,  // 0, 4, 8... depending on needed extra transfers
-  "rationale": "short summary"
+  "hit_cost": 0,
+  "rationale": "short summary explaining form, fixtures, nailedness, budget logic"
 }}
 
+No extra keys. No narrative text.
+
+============================================================
 TEAM JSON:
+============================================================
 {json.dumps(current_team)}
 
+============================================================
 SQUAD STATE JSON:
+============================================================
 {json.dumps(squad_state)}
 
+============================================================
 CANDIDATE POOL JSON:
+============================================================
 {json.dumps(candidate_pool)}
 """
-
-
-def recommend_transfers(
-    gw: int,
-    current_team: Dict[str, Any],
-    squad_state: Dict[str, Any],
-    candidate_pool: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    prompt = build_transfer_prompt(gw, current_team, squad_state, candidate_pool)
-    return ask_llm(prompt)
-
 
 # -------------------------------------------------
 # AI FREE HIT ADVISOR (GW-specific)
 # -------------------------------------------------
+def build_freehit_prompt(gw: int, fh_state: Dict[str, Any], candidate_pool: List[Dict[str, Any]]):
+    """
+    Builds prompt instructing LLM to construct a Free Hit squad.
+    """
+    return f"""
+You are an elite FPL strategist.
+Your task is to build the best possible Free Hit squad for Gameweek {gw}.
 
-def build_freehit_prompt(gw: int, candidate_pool: list, budget: float):
-    prompt = f"""
-        You are an elite Fantasy Premier League strategist.
-        
-        Build the **best possible FREE HIT squad for GW{gw}** using ONLY the players provided in candidate_pool.
-        
-        STRICT RULES YOU MUST FOLLOW (NO EXCEPTIONS):
-        
-        1. **Exactly 15 players** must be selected.
-        2. The squad MUST contain:
-           - **2 goalkeepers**
-           - **5 defenders**
-           - **5 midfielders**
-           - **3 forwards**
-           Any other distribution is INVALID.
-        
-        3. **NO duplicate players.**
-        
-        4. **Total price MUST NOT exceed {budget} million.**
-        
-        5. **You MUST NOT select any player where injury_risk = true.**
-           Injury risk definition:
-           - Minutes = 0 in last GW
-           - OR 0 minutes in 2 of last 3 GWs.
-        
-        6. Prefer players with:
-           - strong last 6-game performance
-           - nailed minutes (regular starter)
-           - strong attacking or defensive returns
-           - favorable fixture in GW{gw}
-           - strong xGI trend
-        
-        7. Respond ONLY in STRICT JSON. No commentary, no backticks.
-        
-        JSON FORMAT:
-        {{
-          "gameweek": {gw},
-          "squad": [
-            {{
-              "id": number,
-              "name": "...",
-              "team": "...",
-              "pos": "GK|DEF|MID|FWD",
-              "price": number,
-              "reason": "why this player is chosen"
-            }}
-          ],
-          "total_price": number,
-          "rationale": "overall explanation"
-        }}
-        
-        Here is the candidate_pool:
-        {json.dumps(candidate_pool)}
-        """
-    return prompt
+===============================
+FREE HIT RULES
+===============================
+1) Budget: {fh_state["budget"]} million.
+2) You must pick exactly:
+   - 2 GKs
+   - 5 DEFs
+   - 5 MIDs
+   - 3 FWDs
+3) Max 3 players per club.
+4) Prioritise:
+   - nailed starters
+   - strong recent form
+   - favourable fixtures (FDR next 3–5 GWs)
+   - high expected minutes
+   - no injuries or doubts
+5) Include captain_id + vice_id.
+6) Output STRICT JSON, no explanation text outside JSON.
 
+===============================
+OUTPUT JSON FORMAT
+===============================
+{{
+  "gameweek": {gw},
+  "budget_used": float,
+  "players": [
+    {{
+      "id": int,
+      "name": "string",
+      "team": "string",
+      "position": "GK/DEF/MID/FWD",
+      "price": float,
+      "reason": "short explanation"
+    }}
+  ],
+  "captain_id": int,
+  "vice_id": int,
+  "summary": "short rationale"
+}}
 
-
-def recommend_freehit_squad(
-    gw: int,
-    candidate_pool: List[Dict[str, Any]],
-    budget: float,
-) -> Dict[str, Any]:
-    prompt = build_freehit_prompt(gw, candidate_pool, budget)
-    return ask_llm(prompt)
+CANDIDATE POOL:
+{json.dumps(candidate_pool)}
+"""
