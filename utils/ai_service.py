@@ -1,8 +1,7 @@
 import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 
 from utils.ai_data_builder import (
-    load_team_json,
     build_squad_for_gw,
     build_team_json,
     build_squad_state,
@@ -10,114 +9,120 @@ from utils.ai_data_builder import (
     reduce_candidate_pool_for_transfers,
 )
 from utils.ai_predictor import (
-    predict_h2h,
-    advise_captaincy,
-    build_transfer_prompt, build_freehit_prompt,
+    ask_llm,
+    build_captaincy_prompt,
+    build_transfer_prompt,
+    build_freehit_prompt,
 )
-
-from utils.ai_predictor import ask_llm
 from utils.ai_service_helpers import sanitize_llm_transfer_output
-
-
-# -------------------------------------------------
-# AI SERVICE LAYER — clean and simple public API
-# -------------------------------------------------
+from utils.ai_predictor import build_h2h_prompt, ask_llm
+from utils.ai_data_builder import load_team_json
 
 # -------------------------------------------------
-# 1) H2H PREDICTION
+# CAPTAINCY ADVICE
 # -------------------------------------------------
 
-def h2h_prediction(entry_a: int, entry_b: int, gw: int,
-                   mc_baseline: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
-    """
-    AI H2H predictor for a specific GW.
-
-    Args:
-        entry_a: ID prvog FPL tima
-        entry_b: ID drugog FPL tima
-        gw: gameweek koji analiziramo
-        mc_baseline: opciono {"team_a_expected": x, "team_b_expected": y}
-
-    Returns:
-        Dict sa AI predikcijom H2H meča.
-    """
-    teamA = load_team_json(entry_a)
-    teamB = load_team_json(entry_b)
-
-    result = predict_h2h(teamA, teamB, gw, mc_baseline)
-    return result
-
-
-
-# -------------------------------------------------
-# 2) CAPTAINCY ADVICE
-# -------------------------------------------------
 
 def captaincy_advice(entry_id: int, gw: int) -> Dict[str, Any]:
     """
-    AI captaincy advisor for given GW.
-    Uses squad of last completed GW before the target GW.
+    High-level service:
+    - builds squad for target GW (using GW-1),
+    - builds compact team context,
+    - asks LLM for captaincy advice.
     """
-    team_json = load_team_json(entry_id)
+    team_ctx = build_team_json(entry_id)
     squad = build_squad_for_gw(entry_id, gw)
 
-    # Friendly for debugging:
-    print(f"[AI] Captaincy analysis for GW{gw}, using squad from GW{squad[0]['last_gw_used']}.")
+    use_gw = squad[0]["last_gw_used"] if squad else gw - 1
+    print(f"[AI] Captaincy analysis for GW{gw}, using squad from GW{use_gw}.")
 
-    return advise_captaincy(gw, squad, team_json)
+    prompt = build_captaincy_prompt(gw, squad, team_ctx)
+    rsp = ask_llm(prompt)
+
+    if rsp["error"]:
+        return {
+            "error": rsp["error"],
+            "raw": rsp["raw"],
+        }
+
+    return rsp["json"]
 
 
 # -------------------------------------------------
-# 3) TRANSFER ADVICE
+# TRANSFER ADVICE
 # -------------------------------------------------
 
-def transfer_advice(entry_id: int, gw: int, candidate_pool_size: int = 120):
-    """
-    Main transfer advisor.
-    Assembles dataset → reduces candidate pool → builds prompt → queries LLM → validates response.
-    """
 
-    # Build data sources
-    team_json = build_team_json(entry_id)
+def transfer_advice(
+    entry_id: int,
+    gw: int,
+    candidate_pool_size: int = 120,
+) -> Dict[str, Any]:
+    """
+    High-level service for transfer recommendations.
+
+    Steps:
+    - Build team context
+    - Build squad_state for GW-1
+    - Build global candidate pool
+    - Reduce candidate pool (status, 3-per-club, etc.)
+    - Build transfer prompt
+    - Ask LLM
+    - Validate output (position, budget, 3-per-club)
+    """
+    team_ctx = build_team_json(entry_id)
     squad_state = build_squad_state(entry_id, gw)
     pool_full = build_candidate_pool(limit=candidate_pool_size, gw=gw)
     pool_reduced = reduce_candidate_pool_for_transfers(squad_state, pool_full)
 
-    # Build prompt
-    prompt = build_transfer_prompt(gw, team_json, squad_state, pool_reduced)
+    print(
+        f"[AI] Transfer advice for GW{gw}, "
+        f"using last completed squad & bank from team_stats.json."
+    )
 
-    # Ask LLM
-    response = ask_llm(prompt)
+    prompt = build_transfer_prompt(gw, team_ctx, squad_state, pool_reduced)
+    rsp = ask_llm(prompt)
 
-    if response["error"]:
+    if rsp["error"]:
         return {
-            "error": response["error"],
-            "raw": response["raw"]
+            "error": rsp["error"],
+            "raw": rsp["raw"],
         }
 
-    llm_json = response["json"]
-
-    # Validate!
-    sanitized = sanitize_llm_transfer_output(llm_json, squad_state, pool_reduced)
+    # Validate the suggestion
+    sanitized = sanitize_llm_transfer_output(
+        rsp["json"],
+        squad_state,
+        pool_reduced,
+    )
 
     return sanitized
 
 
 # -------------------------------------------------
-# 4) FREE HIT ADVICE
+# FREE HIT ADVICE (GLOBAL, NO ENTRY)
 # -------------------------------------------------
-def freehit_advice(gw: int, budget: float, pool_size: int = 150):
+def freehit_advice(
+    gw: int,
+    candidate_pool_size: int = 150,
+    budget: float = 100.0,
+) -> Dict[str, Any]:
     """
-    Free Hit AI builder:
-    - Does NOT depend on user's existing team.
-    - Builds full 15-man squad from scratch.
+    High-level service for Free Hit squad generation.
+    Global — does NOT depend on a specific team.
     """
-    # Build candidate pool
-    pool = build_candidate_pool(limit=pool_size, gw=gw)
 
-    # Create simple FH state
+    # Build raw candidate pool
+    pool_full = build_candidate_pool(limit=candidate_pool_size, gw=gw)
+
+    # Filter obvious no-play players if we have status
+    pool_filtered = [
+        p for p in pool_full
+        if p.get("status") not in ("i", "s", "u")  # injury/susp/unavailable
+    ]
+
+    # Build Free Hit state block
     fh_state = {
-        "target_gw": gw,
         "budget": budget,
         "max_from_club": 3,
         "requirements": {
@@ -128,54 +133,59 @@ def freehit_advice(gw: int, budget: float, pool_size: int = 150):
         }
     }
 
-    print(f"[AI] Building Free Hit squad for GW{gw} with budget £{budget}m.")
+    print(
+        f"[AI] Free Hit team generation for GW{gw} with budget {budget}, "
+        f"using {len(pool_filtered)} candidates."
+    )
 
-    prompt = build_freehit_prompt(gw, fh_state, pool)
-    resp = ask_llm(prompt)
+    prompt = build_freehit_prompt(gw, fh_state, pool_filtered)
+    rsp = ask_llm(prompt)
 
-    # If LLM failed completely
-    if isinstance(resp, dict) and resp.get("error"):
+    if rsp["error"]:
         return {
-            "error": resp["error"],
-            "raw_response": resp.get("raw")
+            "error": rsp["error"],
+            "raw": rsp["raw"],
         }
 
-    return resp
+    return rsp["json"]
 
 
 # -------------------------------------------------
-# 5) ENTRY-POINT HELPERS (OPTIONAL)
+# H2H prediction
 # -------------------------------------------------
+def h2h_prediction(
+    entry_a: int,
+    entry_b: int,
+    gw: int,
+    mc_baseline: Optional[Dict[str, float]] = None
+) -> Dict[str, Any]:
+    """
+    High-level H2H predictor.
+    Loads team data, builds prompt, queries LLM, returns parsed JSON.
+    """
 
-def pretty_print(obj: Dict[str, Any]):
-    """Nice print in terminal."""
-    print(json.dumps(obj, indent=2))
+    team_a = load_team_json(entry_a)
+    team_b = load_team_json(entry_b)
 
-def validate_freehit_squad(squad: list):
-    errors = []
+    if mc_baseline:
+        print(f"[AI] Using Monte Carlo baseline: {mc_baseline}")
 
-    pos_count = {"GK": 0, "DEF": 0, "MID": 0, "FWD": 0}
-    seen = set()
+    print(f"[AI] H2H prediction for GW{gw}: {entry_a} vs {entry_b}")
 
-    for p in squad:
-        # count positions
-        if p["pos"] not in pos_count:
-            errors.append(f"Invalid position for {p['name']}: {p['pos']}")
-        else:
-            pos_count[p["pos"]] += 1
+    prompt = build_h2h_prompt(
+        team_a=team_a,
+        team_b=team_b,
+        gw=gw,
+        mc_baseline=mc_baseline
+    )
 
-        # duplicate
-        if p["id"] in seen:
-            errors.append(f"Duplicate player: {p['name']}")
-        seen.add(p["id"])
+    rsp = ask_llm(prompt)
 
-    if pos_count["GK"] != 2:
-        errors.append(f"Expected 2 GKs, got {pos_count['GK']}")
-    if pos_count["DEF"] != 5:
-        errors.append(f"Expected 5 DEFs, got {pos_count['DEF']}")
-    if pos_count["MID"] != 5:
-        errors.append(f"Expected 5 MIDs, got {pos_count['MID']}")
-    if pos_count["FWD"] != 3:
-        errors.append(f"Expected 3 FWDs, got {pos_count['FWD']}")
+    if rsp["error"]:
+        return {
+            "error": rsp["error"],
+            "raw": rsp["raw"]
+        }
 
-    return errors
+    return rsp["json"]
+

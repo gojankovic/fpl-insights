@@ -1,62 +1,96 @@
-def validate_transfer_suggestion(
-    squad_state,
-    suggestion,
-    candidate_pool
-):
-    """
-    Validate a single transfer suggestion coming from the LLM.
-    Returns (True, "") if valid, otherwise (False, reason).
-    """
+from typing import Dict, Any, List, Tuple
 
-    # Extract
+
+def _find_in_squad(squad_state: Dict[str, Any], player_id: int) -> Dict[str, Any] | None:
+    """
+    Find a player dict in current squad by ID.
+    """
+    for p in squad_state["squad"]:
+        if p["id"] == player_id:
+            return p
+    return None
+
+
+def _find_in_pool(candidate_pool: List[Dict[str, Any]], player_id: int) -> Dict[str, Any] | None:
+    """
+    Find a player dict in candidate pool by ID.
+    """
+    for p in candidate_pool:
+        if p["id"] == player_id:
+            return p
+    return None
+
+
+def validate_transfer_suggestion(
+    squad_state: Dict[str, Any],
+    suggestion: Dict[str, Any],
+    candidate_pool: List[Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """
+    Validate a single transfer suggestion from the LLM.
+
+    Checks:
+    - outgoing player must be in squad
+    - incoming player must be in candidate_pool
+    - positions must match
+    - cannot buy player already owned
+    - respect 3-per-club rule after transfer
+    - respect budget: out_price + bank >= in_price
+    """
     out_id = suggestion.get("out_id")
     in_id = suggestion.get("in_id")
 
-    squad = squad_state["squad"]
-    bank = squad_state["bank"]
-    club_counts = dict(squad_state["club_counts"])
+    if out_id is None or in_id is None:
+        return False, "out_id or in_id is missing."
 
-    # Find outgoing/incoming players
-    outgoing = next((p for p in squad if p["id"] == out_id), None)
-    incoming = next((p for p in candidate_pool if p["id"] == in_id), None)
+    out_player = _find_in_squad(squad_state, out_id)
+    if out_player is None:
+        return False, f"Outgoing player {out_id} is not in squad."
 
-    if outgoing is None:
-        return False, f"Outgoing player {out_id} not found in squad."
-
-    if incoming is None:
+    in_player = _find_in_pool(candidate_pool, in_id)
+    if in_player is None:
         return False, f"Incoming player {in_id} not found in candidate pool."
 
-    # Cannot buy player already owned
-    owned_ids = {p["id"] for p in squad}
-    if in_id in owned_ids:
-        return False, f"Incoming player {incoming['name']} is already owned."
+    # Position check
+    if out_player.get("pos") != in_player.get("pos"):
+        return False, "Positions must match (GK→GK, DEF→DEF, MID→MID, FWD→FWD)."
 
-    # Position constraint
-    if outgoing["pos"] != incoming["pos"]:
-        return False, f"Position mismatch: {outgoing['pos']} → {incoming['pos']}"
+    # Already owned check
+    owned_ids = {p["id"] for p in squad_state["squad"]}
+    if in_id in owned_ids:
+        return False, "Cannot buy a player that is already owned."
+
+    # 3-per-club rule
+    club_counts = dict(squad_state.get("club_counts", {}))
+    out_team = out_player.get("team")
+    in_team = in_player.get("team")
+
+    new_count = club_counts.get(in_team, 0)
+    if in_team == out_team:
+        # same club: count unchanged
+        pass
+    else:
+        # remove one from out_team, add one to in_team
+        if out_team is not None:
+            club_counts[out_team] = max(0, club_counts.get(out_team, 0) - 1)
+        club_counts[in_team] = club_counts.get(in_team, 0) + 1
+        new_count = club_counts[in_team]
+
+    if new_count > 3:
+        return False, f"Transfer breaks 3-per-club rule for {in_team}."
 
     # Budget check
-    if incoming["price"] > outgoing.get("price", 0) + bank:
+    bank = float(squad_state.get("bank", 0.0))
+
+    out_price = out_player.get("price")
+    in_price = in_player.get("price")
+
+    if out_price is None or in_price is None:
+        return False, "Missing price information for players."
+
+    if in_price > out_price + bank + 1e-6:
         return False, (
-            f"Budget violation: need {incoming['price']} but only have "
-            f"{outgoing.get('price', 0) + bank}"
+            f"Not enough budget: {in_price} > {out_price} + bank({bank})."
         )
 
-    # Club limit
-    in_team = incoming["team"]
-    if in_team:
-        if club_counts.get(in_team, 0) >= 3:
-            return False, f"Club limit exceeded for {in_team}"
-
-    # Injury/suspension
-    if incoming.get("injury"):
-        return False, f"Cannot buy injured player {incoming['name']}."
-
-    if incoming.get("suspended"):
-        return False, f"Cannot buy suspended player {incoming['name']}."
-
-    # Expected minutes check
-    if incoming.get("expected_minutes", 0) < 45:
-        return False, f"Incoming player {incoming['name']} has low expected minutes."
-
-    return True, ""
+    return True, "OK"

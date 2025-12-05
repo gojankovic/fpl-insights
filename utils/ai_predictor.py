@@ -21,105 +21,73 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # -------------------------------------------------
 # LOW-LEVEL LLM WRAPPER
 # -------------------------------------------------
+
 def ask_llm(prompt: str) -> Dict[str, Any]:
     """
-    Sends a prompt to the LLM and extracts JSON safely.
-    Supports markdown fences like ```json ... ```
-    Returns:
+    Sends a prompt to the LLM and expects a pure JSON object back.
+    Uses OpenAI's response_format to enforce JSON and then parses it.
+    Returns a dict:
       {
-        "raw": str,
-        "json": dict | None,
-        "error": str | None
+        "raw": original_text,
+        "json": parsed_json_or_None,
+        "error": error_message_or_None
       }
     """
-    response = client.chat.completions.create(
-        model="gpt-5-mini",
-        messages=[
-            {"role": "system", "content": "You are an expert FPL analyst. Always output strict JSON."},
-            {"role": "user", "content": prompt}
-        ],
-    )
-
-    raw = response.choices[0].message.content.strip()
-
-    # Step 1: extract JSON block from markdown fences
-    if "```" in raw:
-        parts = raw.split("```")
-        # find any part that looks like JSON
-        for part in parts:
-            part = part.strip()
-            if part.startswith("{") and part.endswith("}"):
-                raw = part
-                break
-
-    # Step 2: fallback — find first "{" and last "}"
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = raw[start:end + 1]
-    else:
-        return {"raw": raw, "json": None, "error": "No JSON object found in response."}
-
-    # Step 3: decode JSON
     try:
-        parsed = json.loads(candidate)
+        response = client.chat.completions.create(
+            model="gpt-5-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert Fantasy Premier League (FPL) analyst. "
+                        "You MUST respond with a single valid JSON object only, "
+                        "with no surrounding markdown or explanation."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+    except Exception as e:
+        return {"raw": None, "json": None, "error": f"LLM request error: {e}"}
+
+    raw = (response.choices[0].message.content or "").strip()
+
+    try:
+        parsed = json.loads(raw)
         return {"raw": raw, "json": parsed, "error": None}
     except json.JSONDecodeError as e:
         return {"raw": raw, "json": None, "error": f"JSON decode error: {e}"}
 
 
 # -------------------------------------------------
-# BASIC
+# 1) TEAM-LEVEL ANALYSIS
 # -------------------------------------------------
 
 def build_team_prompt(team_json: Dict[str, Any]) -> str:
-    return f"""
-You are an expert Fantasy Premier League analyst.
-
-You will receive JSON representing one FPL team across all gameweeks
-(exported from a local database, not from the official API).
-
-This JSON typically has fields like:
-- entry_id
-- team_name
-- manager
-- total_points
-- current_overall_rank
-- chips (by GW)
-- gw_data: array of gameweeks, each containing:
-  - gw, points, overall_rank, gw_rank, transfers, transfer_cost, value, bank, chip
-  - team: starting, bench, captain_id, vice_id, starting_total, bench_total
-
-USAGE:
-- Look at patterns of points, rank movement, chip usage, bench strength.
-- Look at most consistent and explosive players in starting XIs.
-- Look how aggressive the manager is with transfers and hits.
-
-TASK:
-Predict performance for the NEXT gameweek in a realistic way.
-Do NOT hallucinate unknown fixtures. You don't know exact opponents or odds,
-you only know how this manager's team has performed so far.
-
-Respond STRICTLY with a JSON object:
-
-{{
-  "predicted_points": number,
-  "key_players": [
-    {{
-      "id": int,
-      "reason": "short explanation"
-    }}
-  ],
-  "weak_spots": [
-    "short bullet explanation"
-  ],
-  "recommended_transfer": "one concise suggestion, or 'none' if you cannot say",
-  "confidence": "low|medium|high"
-}}
-
-Here is the team JSON:
-{json.dumps(team_json)}
-"""
+    """
+    Build prompt for season-level team analysis / next-GW expectation.
+    """
+    return (
+        "You are an expert Fantasy Premier League analyst.\n\n"
+        "You will receive JSON for a single FPL team across the season. "
+        "The JSON contains things like: entry_id, team_name, manager, total_points, "
+        "rank history and a gw_data array with one object per gameweek "
+        "(points, rank, transfers, chip, starting XI, bench, etc.).\n\n"
+        "TASK:\n"
+        "Based only on this JSON, estimate performance in the NEXT gameweek and "
+        "summarize the key strengths and weaknesses of the team so far.\n\n"
+        "You MUST respond with a JSON object with at least the following keys:\n"
+        "- predicted_points: number (expected FPL points for the next GW)\n"
+        "- key_players: array of objects with {\"id\": int, \"reason\": string}\n"
+        "- weak_spots: array of strings (short bullet-style descriptions)\n"
+        "- recommended_transfer: string (one concise suggestion or 'none')\n"
+        "- confidence: one of 'low', 'medium', 'high'\n\n"
+        "Use only the numbers and patterns you see in the JSON. "
+        "Do not invent fixtures or external stats.\n\n"
+        f"TEAM JSON:\n{json.dumps(team_json)}"
+    )
 
 
 def predict_team_performance(team_json: Dict[str, Any]) -> Dict[str, Any]:
@@ -127,34 +95,31 @@ def predict_team_performance(team_json: Dict[str, Any]) -> Dict[str, Any]:
     return ask_llm(prompt)
 
 
+# -------------------------------------------------
+# 2) PLAYER-LEVEL ANALYSIS
+# -------------------------------------------------
+
 def build_player_prompt(player_json: Dict[str, Any]) -> str:
     """
-    Prompt za jednog igrača (npr. history iz player_history).
+    Prompt for a single player's performance expectation.
+    player_json can contain:
+      - basic info (id, name, team, position)
+      - per-gameweek stats (goals, assists, minutes, total_points, etc.)
     """
-    return f"""
-You are an FPL performance analyst.
-
-Below is a JSON object describing a player's:
-- basic info (id, name, team, position)
-- per-gameweek stats from a local database (goals, assists, total_points, minutes, etc.)
-
-Use ONLY this data. Do NOT invent fixtures, do NOT assume future transfers.
-
-TASK:
-Estimate this player's expected FPL points in the next gameweek,
-based on trends: recent points, minutes, attacking/defensive returns.
-
-Respond STRICTLY with JSON:
-
-{{
-  "expected_points": number,
-  "risk_level": "low|medium|high",
-  "reasoning": "short explanation using data from the JSON"
-}}
-
-Player JSON:
-{json.dumps(player_json)}
-"""
+    return (
+        "You are an FPL performance analyst.\n\n"
+        "You will receive JSON describing one player: "
+        "basic info plus per-gameweek stats from a local database.\n\n"
+        "TASK:\n"
+        "Estimate this player's expected FPL points in the NEXT gameweek, "
+        "based on trends in recent matches (points, minutes, attacking returns).\n\n"
+        "You MUST respond with a JSON object with at least:\n"
+        "- expected_points: number\n"
+        "- risk_level: 'low' | 'medium' | 'high'\n"
+        "- reasoning: short string explaining the estimate using the given data\n\n"
+        "Do not invent fixtures or extra stats. Only use the JSON.\n\n"
+        f"PLAYER JSON:\n{json.dumps(player_json)}"
+    )
 
 
 def predict_player_performance(player_json: Dict[str, Any]) -> Dict[str, Any]:
@@ -162,40 +127,29 @@ def predict_player_performance(player_json: Dict[str, Any]) -> Dict[str, Any]:
     return ask_llm(prompt)
 
 
+# -------------------------------------------------
+# 3) SEASON-LONG TEAM COMPARISON
+# -------------------------------------------------
+
 def build_compare_prompt(team_a: Dict[str, Any], team_b: Dict[str, Any]) -> str:
     """
-    Generalni prompt za poređenje dva tima (sezona).
-    Ovo je više long-term stil, dok ćemo H2H ispod praviti GW-specific.
+    Prompt for comparing two teams across the whole season.
     """
-    return f"""
-You are an expert FPL analyst.
-
-You are comparing TWO teams across their season data.
-Each JSON is exported from a local database.
-
-FIELDS:
-Both teams have:
-- meta: team_name, manager, total_points, current_overall_rank
-- gw_data: per-GW history with points, rank, transfers, chips, starting XI etc.
-
-TASK:
-Make a SEASON-LONG comparison: who has been stronger so far and why.
-
-Respond STRICTLY with JSON:
-
-{{
-  "team_a_better_in": ["short bullets"],
-  "team_b_better_in": ["short bullets"],
-  "summary": "short paragraph",
-  "overall_stronger_team": "A|B|Even"
-}}
-
-TEAM A:
-{json.dumps(team_a)}
-
-TEAM B:
-{json.dumps(team_b)}
-"""
+    return (
+        "You are an expert FPL analyst.\n\n"
+        "You will receive JSON for TWO different FPL teams, "
+        "each with season history (points, ranks, transfers, chips, etc.).\n\n"
+        "TASK:\n"
+        "Compare the teams over the full season and decide who has been stronger so far.\n\n"
+        "You MUST respond with a JSON object containing at least:\n"
+        "- team_a_better_in: array of short strings\n"
+        "- team_b_better_in: array of short strings\n"
+        "- summary: short string comparing styles and strengths\n"
+        "- overall_stronger_team: 'A' | 'B' | 'Even'\n\n"
+        "Use ONLY the numbers and patterns in the JSON.\n\n"
+        f"TEAM A JSON:\n{json.dumps(team_a)}\n\n"
+        f"TEAM B JSON:\n{json.dumps(team_b)}"
+    )
 
 
 def compare_teams(team_a_json: Dict[str, Any], team_b_json: Dict[str, Any]) -> Dict[str, Any]:
@@ -204,7 +158,7 @@ def compare_teams(team_a_json: Dict[str, Any], team_b_json: Dict[str, Any]) -> D
 
 
 # -------------------------------------------------
-# AI H2H PREDICTOR (GW-specific)
+# 4) AI H2H PREDICTOR (GW-specific)
 # -------------------------------------------------
 
 def build_h2h_prompt(
@@ -214,84 +168,42 @@ def build_h2h_prompt(
     mc_baseline: Optional[Dict[str, float]] = None,
 ) -> str:
     """
-    Prompt za AI H2H predict za KONKRETAN GW.
-
-    mc_baseline je opciono:
-      {{
-        "team_a_expected": float,
-        "team_b_expected": float
-      }}
-    iz tvog Monte Carlo modela, ako želiš da ga proslediš.
+    Prompt for AI H2H prediction for a specific gameweek.
+    Optional mc_baseline is a dict like:
+      {"team_a_expected": float, "team_b_expected": float}
+    coming from your numeric Monte Carlo model.
     """
-    baseline_txt = json.dumps(mc_baseline) if mc_baseline else "null"
+    baseline_txt = json.dumps(mc_baseline) if mc_baseline is not None else "null"
 
-    return f"""
-You are an FPL head-to-head match analyst.
-
-You will receive:
-- TEAM A JSON
-- TEAM B JSON
-Each JSON includes season data AND detailed info for each GW:
-points, ranks, transfers, chip usage, starting XIs with player-level points.
-
-You will ALSO receive optional Monte Carlo baseline expected points
-for this specific gameweek from a separate numeric model.
-
-Gameweek of interest: GW {gw}.
-
-RULES:
-- Use ONLY the JSON and the numeric baseline if provided.
-- Look especially at the LAST 4-6 gameweeks for each team to understand trends.
-- Consider captaincy patterns (aggressive vs safe), bench strength,
-  and how often the manager's high-risk decisions paid off.
-- Do NOT invent fixtures or odds. You are only predicting RELATIVE outcomes.
-
-TASK:
-Predict the H2H outcome for THIS GAMEWEEK, with confidence.
-
-Respond STRICTLY with JSON:
-
-{{
-  "gameweek": {gw},
-  "team_a_expected_points": number,
-  "team_b_expected_points": number,
-  "win_probabilities": {{
-    "team_a": number,   // 0-100
-    "team_b": number,   // 0-100
-    "draw": number      // 0-100, all three should roughly sum to 100
-  }},
-  "key_factors": [
-    "short bullet about main factor 1",
-    "short bullet about main factor 2"
-  ],
-  "who_is_favored": "A|B|Even",
-  "confidence": "low|medium|high",
-  "based_on_monte_carlo": {str(mc_baseline is not None).lower()}
-}}
-
-TEAM A JSON:
-{json.dumps(team_a)}
-
-TEAM B JSON:
-{json.dumps(team_b)}
-
-MONTE CARLO BASELINE (can be null):
-{baseline_txt}
-"""
-
-
-def predict_h2h(
-    team_a_json: Dict[str, Any],
-    team_b_json: Dict[str, Any],
-    gw: int,
-    mc_baseline: Optional[Dict[str, float]] = None,
-) -> Dict[str, Any]:
-    prompt = build_h2h_prompt(team_a_json, team_b_json, gw, mc_baseline)
-    return ask_llm(prompt)
-
+    return (
+        "You are an FPL head-to-head match analyst.\n\n"
+        f"Target gameweek: {gw}.\n\n"
+        "You will receive JSON for TEAM A and TEAM B, each containing season history "
+        "plus per-GW details (points, ranks, transfers, chips, starting XI).\n"
+        "You will also receive an OPTIONAL Monte Carlo baseline with expected points for "
+        "this GW from a numeric model. It may be null.\n\n"
+        "RULES:\n"
+        "- Use ONLY the JSON and the numeric baseline if present.\n"
+        "- Look especially at the last 4–6 GWs for trends (form, captain choices, hits).\n"
+        "- Do not invent fixtures or odds outside what you can infer from the data.\n\n"
+        "TASK:\n"
+        "Predict this specific H2H outcome.\n\n"
+        "You MUST respond with a JSON object containing at least:\n"
+        "- gameweek: number\n"
+        "- team_a_expected_points: number\n"
+        "- team_b_expected_points: number\n"
+        "- win_probabilities: object with numeric fields team_a, team_b, draw (0–100 each)\n"
+        "- key_factors: array of short strings (why)\n"
+        "- who_is_favored: 'A' | 'B' | 'Even'\n"
+        "- confidence: 'low' | 'medium' | 'high'\n"
+        "- based_on_monte_carlo: boolean\n\n"
+        f"TEAM A JSON:\n{json.dumps(team_a)}\n\n"
+        f"TEAM B JSON:\n{json.dumps(team_b)}\n\n"
+        f"MONTE CARLO BASELINE:\n{baseline_txt}"
+    )
 
 # -------------------------------------------------
-# AI CAPTAINCY ADVISOR
+# 5) AI CAPTAINCY ADVISOR
 # -------------------------------------------------
 
 def build_captaincy_prompt(
@@ -300,71 +212,47 @@ def build_captaincy_prompt(
     context_team: Dict[str, Any],
 ) -> str:
     """
-    squad_players je lista igrača iz TVOG tima za taj GW, npr:
-    [
-      {
-        "id": 177,
-        "name": "Mohamed Salah",
-        "team": "LIV",
-        "pos": "MID",
-        "gw_history": [... per-GW stats objects ...],
-        "is_nailed": true/false,
-        "injury_flag": "fit|doubt|out"
-      },
-      ...
-    ]
-
-    context_team je npr. tvoj team_stats.json (ceo), da vidi pattern kapitena.
+    squad_players: list of your players for the relevant GW, for example:
+      [
+        {
+          "id": 177,
+          "name": "Mohamed Salah",
+          "team": "LIV",
+          "pos": "MID",
+          "gw_history": [... per-GW stats objects ...],
+          "recent_form": float,
+          "expected_minutes": int,
+          "injury": bool,
+          "suspended": bool,
+          "rotation_risk": "low|medium|high|unknown"
+        },
+        ...
+      ]
+    context_team: your full season team_stats JSON, used to detect manager style.
     """
-    return f"""
-You are an FPL captaincy advisor.
-
-You will receive:
-1) Full season context for the manager (TEAM JSON).
-2) A list of CANDIDATE PLAYERS from this manager's current squad,
-   with per-gameweek stats and simple flags (nailed/injury).
-
-Gameweek of interest: GW {gw}.
-
-RULES:
-- Use ONLY the given stats. Do not invent fixtures or odds.
-- Focus on recent form (last 4-6 GWs), explosiveness (double-digit hauls),
-  consistency (few blanks), and minutes reliability.
-- Consider also how this manager usually picks captains (aggressive/safe).
-
-TASK:
-Recommend CAPTAIN and VICE-CAPTAIN for this gameweek.
-
-Respond STRICTLY with JSON:
-
-{{
-  "gameweek": {gw},
-  "suggested_captain": {{
-    "id": int,
-    "name": "string",
-    "reason": "short explanation"
-  }},
-  "suggested_vice_captain": {{
-    "id": int,
-    "name": "string",
-    "reason": "short explanation"
-  }},
-  "other_viable_options": [
-    {{
-      "id": int,
-      "name": "string",
-      "reason": "short explanation"
-    }}
-  ],
-  "notes": "short extra advice if needed"
-}}
-
-TEAM CONTEXT JSON:
-{json.dumps(context_team)}
-
-SQUAD PLAYERS JSON:
-{json.dumps(squad_players)}
-"""
+    return (
+        "You are an FPL captaincy advisor.\n\n"
+        f"Gameweek of interest: {gw}.\n\n"
+        "You will receive:\n"
+        "1) Full season context for the manager (TEAM JSON).\n"
+        "2) A list of candidate players from this manager's current squad, "
+        "with recent form, minutes, and simple flags (injury / suspension / rotation risk).\n\n"
+        "RULES:\n"
+        "- Use ONLY the provided stats. Do not invent fixtures or external injury info.\n"
+        "- Focus on last 4–6 GWs for form.\n"
+        "- Prefer nailed players with high expected minutes and strong recent form.\n"
+        "- Vice-captain should be a stable alternative in case the captain does not play.\n\n"
+        "TASK:\n"
+        "Recommend CAPTAIN and VICE-CAPTAIN for this GW.\n\n"
+        "You MUST respond with a JSON object containing at least:\n"
+        "- gameweek: number\n"
+        "- suggested_captain: object with fields id, name, reason\n"
+        "- suggested_vice_captain: object with fields id, name, reason\n"
+        "- other_viable_options: array of similar objects (id, name, reason)\n"
+        "- notes: short string with any extra advice\n\n"
+        f"TEAM CONTEXT JSON:\n{json.dumps(context_team)}\n\n"
+        f"SQUAD PLAYERS JSON:\n{json.dumps(squad_players)}"
+    )
 
 
 def advise_captaincy(
@@ -377,177 +265,101 @@ def advise_captaincy(
 
 
 # -------------------------------------------------
-# AI TRANSFER RECOMMENDER
+# 6) AI TRANSFER RECOMMENDER
 # -------------------------------------------------
-def build_transfer_prompt(gw, current_team, squad_state, candidate_pool):
+
+def build_transfer_prompt(
+    gw: int,
+    current_team: Dict[str, Any],
+    squad_state: Dict[str, Any],
+    candidate_pool: List[Dict[str, Any]],
+) -> str:
     """
-    Final, optimized transfer prompt.
-    All comments are removed inside the string so the model does not get distracted.
+    Build prompt for transfer advice.
+    current_team: summary from build_team_json (bank, value, FDR map, etc.).
+    squad_state: result from build_squad_state (squad list, club counts, free_transfers, bank).
+    candidate_pool: reduced pool of good players (already cleaned / filtered).
     """
+    return (
+        "You are an advanced FPL transfer analyst.\n\n"
+        f"Target gameweek: {gw}.\n\n"
+        "You will receive three JSON blocks:\n"
+        "1) TEAM JSON: season context, bank, team value, fixtures.\n"
+        "2) SQUAD STATE: players currently owned (with form, minutes, flags), "
+        "club_counts, free_transfers, bank.\n"
+        "3) CANDIDATE POOL: list of strong players from the whole game, "
+        "with price, form_last3, expected_minutes, injury/suspension flags, rotation_risk, "
+        "and FDR for the next few gameweeks.\n\n"
+        "You must obey standard FPL rules:\n"
+        "- Budget: incoming_player.price <= outgoing_player.price + squad_state.bank\n"
+        "- Position matching only: GK→GK, DEF→DEF, MID→MID, FWD→FWD\n"
+        "- Max 3 players per club after transfers (use club_counts and team fields).\n"
+        "- Never buy a player who is already owned.\n\n"
+        "Transfer logic:\n"
+        "- Suggest usually 1 transfer if free_transfers = 1.\n"
+        "- You MAY suggest 2 transfers (-4 hit) if needed to afford a clearly better upgrade.\n"
+        "- Never suggest more than 2 transfers or a hit worse than -4.\n"
+        "- Prefer selling players with bad form, low minutes, clear rotation risk, "
+        "suspension, or poor upcoming fixtures.\n"
+        "- Prefer buying players with strong form, good minutes, low rotation risk, "
+        "and good upcoming fixtures.\n\n"
+        "Output:\n"
+        "You MUST respond with a JSON object containing at least:\n"
+        "- gameweek: number\n"
+        "- suggested_transfers: array of objects with fields "
+        "out_id, out_name, in_id, in_name, reason\n"
+        "- hit_cost: number (0, 4, or possibly 8 if absolutely necessary)\n"
+        "- rationale: short string explaining form, fixtures, nailedness and budget reasoning\n\n"
+        "Use only UTF-8 characters, no escaped unicode sequences in names.\n\n"
+        "TEAM JSON:\n"
+        f"{json.dumps(current_team)}\n\n"
+        "SQUAD STATE JSON:\n"
+        f"{json.dumps(squad_state)}\n\n"
+        "CANDIDATE POOL JSON:\n"
+        f"{json.dumps(candidate_pool)}"
+    )
 
-    return f"""
-You are an advanced FPL transfer analyst. 
-Your task is to propose realistic, rules-accurate transfers for Gameweek {gw}.
-
-============================================================
-DATA AVAILABLE (DO NOT INVENT DATA)
-============================================================
-TEAM JSON  → season context, value, bank, transfers, fixtures.
-SQUAD STATE → players owned, minutes, form, positional info, club counts.
-CANDIDATE POOL → best available players with stats.
-
-Use ONLY these data sources.
-
-============================================================
-STRICT FPL RULES YOU MUST OBEY
-============================================================
-
-BUDGET
-- incoming_player.price ≤ outgoing_player.price + squad_state.bank
-
-POSITION MATCHING
-- GK→GK
-- DEF→DEF
-- MID→MID
-- FWD→FWD
-
-CLUB LIMIT
-- After transfers: max 3 players per club.
-- Use squad_state["club_counts"] to check limits.
-
-OWNERSHIP RULE
-- Never buy players already owned (use squad_state["squad"])
-
-TRANSFER COUNT LOGIC
-- If squad_state.free_transfers = 1 → normally suggest 1 transfer.
-- You MAY suggest 2 transfers (-4 hit) if needed to afford a clearly superior improvement.
-- Never propose more than 2 transfers.
-- Never exceed a -4 hit.
-
-SELL LOGIC (valid reasons to sell):
-- poor recent form (low recent_form)
-- low expected_minutes
-- rotation risk ("rotation_risk" = "medium" or "high")
-- suspension flag = true
-- injury flag = true
-- significantly worse upcoming fixtures (higher fdr_next5.avg_fdr)
-- obvious downgrade compared to available alternatives at same price bracket
-
-BUY LOGIC (valid reasons to buy):
-- strong recent_form (clear trend across last 3–5 matches)
-- expected_minutes ≥ 60
-- nailed starter (rotation_risk = "low")
-- good upcoming fixtures (low fdr_next5.avg_fdr)
-- excellent value for price
-- fits budget and positional structure
-- improves team long-term
-
-FIXTURE LOGIC (CRITICAL)
-Use fdr_next5.avg_fdr:
-- Lower avg_fdr = easier fixtures
-Compare outgoing vs incoming fixtures:
-- Prefer players with better next 3–5 GWs unless form strongly contradicts.
-
-INJURY / SUSPENSION RULE
-- Never call a player "injured" unless SQUAD STATE or CANDIDATE POOL explicitly shows "injury": true.
-- If minutes = 0 but "injury" is false → treat neutrally (rest/rotation/suspension).
-- If "suspended" = true → treat as suspension.
-
-STYLE RULES
-- Explanations must be short, clean, professional.
-- Use plain UTF-8. Do not use escaped unicode or escaped symbols.
-- Names like "Marcos Senesi Barón" must appear exactly as written.
-
-============================================================
-OUTPUT FORMAT (STRICT JSON ONLY)
-============================================================
-
-Return EXACTLY this structure:
-
-{{
-  "gameweek": {gw},
-  "suggested_transfers": [
-    {{
-      "out_id": int,
-      "out_name": "string",
-      "in_id": int,
-      "in_name": "string",
-      "reason": "clear, short explanation"
-    }}
-  ],
-  "hit_cost": 0,
-  "rationale": "short summary explaining form, fixtures, nailedness, budget logic"
-}}
-
-No extra keys. No narrative text.
-
-============================================================
-TEAM JSON:
-============================================================
-{json.dumps(current_team)}
-
-============================================================
-SQUAD STATE JSON:
-============================================================
-{json.dumps(squad_state)}
-
-============================================================
-CANDIDATE POOL JSON:
-============================================================
-{json.dumps(candidate_pool)}
-"""
 
 # -------------------------------------------------
-# AI FREE HIT ADVISOR (GW-specific)
+# 7) AI FREE HIT ADVISOR
 # -------------------------------------------------
-def build_freehit_prompt(gw: int, fh_state: Dict[str, Any], candidate_pool: List[Dict[str, Any]]):
+
+def build_freehit_prompt(
+    gw: int,
+    fh_state: Dict[str, Any],
+    candidate_pool: List[Dict[str, Any]],
+) -> str:
     """
-    Builds prompt instructing LLM to construct a Free Hit squad.
+    Build prompt for Free Hit squad construction.
+    fh_state should contain:
+      - budget: float
+      - max_from_club: int (usually 3)
+      - requirements: dict like {"GK":2,"DEF":5,"MID":5,"FWD":3}
+    candidate_pool is a rich list of players with stats.
     """
-    return f"""
-You are an elite FPL strategist.
-Your task is to build the best possible Free Hit squad for Gameweek {gw}.
-
-===============================
-FREE HIT RULES
-===============================
-1) Budget: {fh_state["budget"]} million.
-2) You must pick exactly:
-   - 2 GKs
-   - 5 DEFs
-   - 5 MIDs
-   - 3 FWDs
-3) Max 3 players per club.
-4) Prioritise:
-   - nailed starters
-   - strong recent form
-   - favourable fixtures (FDR next 3–5 GWs)
-   - high expected minutes
-   - no injuries or doubts
-5) Include captain_id + vice_id.
-6) Output STRICT JSON, no explanation text outside JSON.
-
-===============================
-OUTPUT JSON FORMAT
-===============================
-{{
-  "gameweek": {gw},
-  "budget_used": float,
-  "players": [
-    {{
-      "id": int,
-      "name": "string",
-      "team": "string",
-      "position": "GK/DEF/MID/FWD",
-      "price": float,
-      "reason": "short explanation"
-    }}
-  ],
-  "captain_id": int,
-  "vice_id": int,
-  "summary": "short rationale"
-}}
-
-CANDIDATE POOL:
-{json.dumps(candidate_pool)}
-"""
+    return (
+        "You are an elite FPL strategist.\n\n"
+        f"Your task is to build the best possible Free Hit squad for Gameweek {gw}.\n\n"
+        "You will receive:\n"
+        "- FH STATE: budget and positional requirements.\n"
+        "- CANDIDATE POOL: list of players with team, position, price, form, minutes, "
+        "injury/suspension flags, rotation risk and fixture difficulty for upcoming gameweeks.\n\n"
+        "Free Hit rules:\n"
+        f"- Budget: {fh_state.get('budget')} million total.\n"
+        "- You must pick exactly the required number of players per position from fh_state.requirements.\n"
+        "- Max 3 players per real-life club.\n"
+        "- Prioritise nailed starters with strong recent form, good minutes, and good fixtures.\n"
+        "- Avoid injured, suspended, or clear high-rotation players.\n\n"
+        "Output:\n"
+        "You MUST respond with a JSON object containing at least:\n"
+        "- gameweek: number\n"
+        "- budget_used: number\n"
+        "- players: array of objects with fields id, name, team, position, price, reason\n"
+        "- captain_id: id of selected captain\n"
+        "- vice_id: id of selected vice-captain\n"
+        "- summary: short string explaining the structure and key ideas\n\n"
+        "FH STATE JSON:\n"
+        f"{json.dumps(fh_state)}\n\n"
+        "CANDIDATE POOL JSON:\n"
+        f"{json.dumps(candidate_pool)}"
+    )
