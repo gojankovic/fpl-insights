@@ -167,14 +167,17 @@ def h2h_prediction(
     team_a = load_team_json(entry_a)
     team_b = load_team_json(entry_b)
 
+    latest_a = extract_latest_gw_squad(team_a)
+    latest_b = extract_latest_gw_squad(team_b)
+
     if mc_baseline:
         print(f"[AI] Using Monte Carlo baseline: {mc_baseline}")
 
     print(f"[AI] H2H prediction for GW{gw}: {entry_a} vs {entry_b}")
 
     prompt = build_h2h_prompt(
-        team_a=team_a,
-        team_b=team_b,
+        team_a=latest_a,
+        team_b=latest_b,
         gw=gw,
         mc_baseline=mc_baseline
     )
@@ -188,4 +191,15 @@ def h2h_prediction(
         }
 
     return rsp["json"]
+
+def extract_latest_gw_squad(team_json):
+    last = max(team_json["gw_data"], key=lambda gw: gw["gw"])
+    return {
+        "gw": last["gw"],
+        "starting": last["team"]["starting"],
+        "bench": last["team"]["bench"],
+        "captain_id": last["team"]["captain_id"],
+        "vice_id": last["team"]["vice_id"]
+    }
+
 
