@@ -83,7 +83,7 @@ python ai.py captaincy --team <entry_id> --gw <gw>
 
 ### Transfer advice
 Supports specifying free transfers and allowed extra transfers (each extra costs -4):
-python ai.py transfers --team <entry_id> --gw <gw> --ft 2 --extra 1
+python ai.py transfers --team <entry_id> --gw <gw> --free_transfers 2 --allowed_extra 1
 
 ### Free Hit builder
 python ai.py freehit --gw <gw> --budget <value> --pool <candidate_count>
