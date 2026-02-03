@@ -114,7 +114,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         player_id INTEGER,
         gameweek INTEGER,
-        minutes INTEGER, 
+        minutes INTEGER,
         total_points INTEGER,
         goals_scored INTEGER,
         assists INTEGER,
@@ -132,6 +132,12 @@ def init_db():
         FOREIGN KEY (player_id) REFERENCES players(id)
     );
     """)
+
+    # Lightweight migration: add missing columns if schema is older.
+    cur.execute("PRAGMA table_info(player_history)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    if "minutes" not in existing_cols:
+        cur.execute("ALTER TABLE player_history ADD COLUMN minutes INTEGER")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS meta (
