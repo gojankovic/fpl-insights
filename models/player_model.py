@@ -1,6 +1,8 @@
 import sqlite3
+from typing import Tuple, List, Dict
+
 import numpy as np
-from typing import Tuple
+
 from config import DB_PATH
 
 def get_player_data(player_id: int) -> dict:
@@ -12,9 +14,12 @@ def get_player_data(player_id: int) -> dict:
     p = c.fetchone()
 
     if not p:
+        conn.close()
         raise ValueError(f"Player {player_id} not found")
 
-    return dict(p)
+    data = dict(p)
+    conn.close()
+    return data
 
 
 def get_player_history_points(player_id: int, last_n: int = 5) -> list:
@@ -31,12 +36,38 @@ def get_player_history_points(player_id: int, last_n: int = 5) -> list:
     """, (player_id, last_n))
 
     rows = [r["total_points"] for r in c.fetchall() if r["total_points"] is not None]
+    conn.close()
     return rows
 
 
-def get_fixture_difficulty(player_id: int, gw: int) -> int:
+def get_player_history(player_id: int, last_n: int = 5) -> List[Dict]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT total_points, minutes
+        FROM player_history
+        WHERE player_id = ?
+        ORDER BY gameweek DESC
+        LIMIT ?
+    """, (player_id, last_n))
+
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {
+            "points": r["total_points"],
+            "minutes": r["minutes"],
+        }
+        for r in rows
+    ]
+
+
+def get_player_fixtures_in_gw(player_id: int, gw: int) -> List[int]:
     """
-    Returns difficulty 1–5 for the given player's fixture in GW.
+    Returns a list of fixture difficulties (1–5) for the given player's GW.
+    Supports blank GW (empty list) and DGW (two values).
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -44,7 +75,11 @@ def get_fixture_difficulty(player_id: int, gw: int) -> int:
 
     # get player team
     c.execute("SELECT team_id FROM players WHERE id = ?", (player_id,))
-    team_id = c.fetchone()["team_id"]
+    team_row = c.fetchone()
+    if not team_row:
+        conn.close()
+        return []
+    team_id = team_row["team_id"]
 
     # find fixture
     c.execute("""
@@ -53,14 +88,77 @@ def get_fixture_difficulty(player_id: int, gw: int) -> int:
         WHERE event = ? AND (team_h = ? OR team_a = ?)
     """, (gw, team_id, team_id))
 
-    fx = c.fetchone()
-    if not fx:
-        return 3  # neutral fallback
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return []
 
-    if fx["team_h"] == team_id:
-        return fx["difficulty_home"]
+    difficulties = []
+    for fx in rows:
+        if fx["team_h"] == team_id:
+            difficulties.append(fx["difficulty_home"])
+        else:
+            difficulties.append(fx["difficulty_away"])
+    return difficulties
+
+
+def get_fixture_difficulty(player_id: int, gw: int) -> int:
+    """
+    Returns difficulty 1–5 for the given player's fixture in GW.
+    For DGW, returns the average difficulty.
+    """
+    diffs = get_player_fixtures_in_gw(player_id, gw)
+    if not diffs:
+        return 3
+    return int(round(float(sum(diffs)) / len(diffs)))
+
+
+def _estimate_expected_minutes(player: dict, history: List[Dict]) -> float:
+    status = player.get("status")
+    if status in ("i", "o", "s"):
+        return 0.0
+
+    recent_minutes = [h["minutes"] for h in history if h.get("minutes") is not None]
+    if recent_minutes:
+        base_minutes = float(sum(recent_minutes)) / len(recent_minutes)
     else:
-        return fx["difficulty_away"]
+        base_minutes = 80.0 if (player.get("starts") or 0) >= 3 else 60.0
+
+    chance = player.get("chance_of_playing_next_round")
+    if chance is not None:
+        base_minutes *= max(0.0, min(float(chance), 100.0)) / 100.0
+
+    return min(base_minutes, 90.0)
+
+
+def _xgi_per90(player: dict) -> float:
+    if player.get("expected_goal_involvements_per_90") is not None:
+        return float(player["expected_goal_involvements_per_90"])
+
+    xg = player.get("expected_goals") or 0.0
+    xa = player.get("expected_assists") or 0.0
+    minutes = player.get("minutes") or 0
+    if minutes <= 0:
+        return 0.0
+    return float((xg + xa) / minutes * 90.0)
+
+
+def _position(player: dict) -> str:
+    pos_map = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+    return pos_map.get(player.get("element_type"), "MID")
+
+
+def get_player_position(player_id: int) -> str:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT element_type FROM players WHERE id = ?", (player_id,))
+    row = c.fetchone()
+    conn.close()
+    pos_map = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+    if not row:
+        return "MID"
+    return pos_map.get(row["element_type"], "MID")
 
 
 def predict_player_points(player_id: int, gw: int) -> Tuple[float, float]:
@@ -68,30 +166,51 @@ def predict_player_points(player_id: int, gw: int) -> Tuple[float, float]:
     Returns (mean, std) points expectation for player in a given GW.
     """
     p = get_player_data(player_id)
+    history = get_player_history(player_id, last_n=5)
 
-    # Expected minutes
-    if p["status"] in ("i", "o"):  # injured/out
-        exp_minutes = 0
-    else:
-        exp_minutes = 80 if (p.get("starts") or 0) >= 3 else 60
+    # Expected minutes for upcoming GW
+    exp_minutes = _estimate_expected_minutes(p, history)
 
-    # Base EP components
-    ppg = p["points_per_game"] or 0
-    form = p["form"] or ppg
-    xgi = (p.get("expected_goals", 0) + p.get("expected_assists", 0))
+    # Base EP components (per full match)
+    season_ppg = p.get("points_per_game") or 0.0
+    recent_ppg = (
+        float(sum(h["points"] for h in history)) / len(history)
+        if history
+        else season_ppg
+    )
+    form = p.get("form") or season_ppg
 
-    base_ep = 0.5 * ppg + 0.3 * form + 0.2 * xgi
+    base_ep = 0.45 * season_ppg + 0.35 * recent_ppg + 0.2 * form
 
-    # Fixture adjustment
-    difficulty = get_fixture_difficulty(player_id, gw)
-    adj = 1 + (3 - difficulty) * 0.1
-    ep = base_ep * adj
+    # xGI bonus scaled by position
+    pos = _position(p)
+    xgi_weight = {"GK": 0.02, "DEF": 0.05, "MID": 0.10, "FWD": 0.12}
+    base_ep += _xgi_per90(p) * xgi_weight.get(pos, 0.08)
+
+    # Fixture adjustment (supports DGW)
+    difficulties = get_player_fixtures_in_gw(player_id, gw)
+    if not difficulties:
+        return 0.0, 0.0
+
+    minutes_per_fixture = exp_minutes
+    if len(difficulties) > 1:
+        minutes_per_fixture = exp_minutes * 0.85
+    minutes_factor = min(minutes_per_fixture, 90.0) / 90.0
+
+    ep_total = 0.0
+    for difficulty in difficulties:
+        adj = 1 + (3 - difficulty) * 0.1
+        ep_total += base_ep * minutes_factor * adj
 
     # STD from history
-    history = get_player_history_points(player_id, last_n=5)
-    if len(history) >= 3:
-        std = float(np.std(history))
+    points_history = [h["points"] for h in history if h.get("points") is not None]
+    if len(points_history) >= 3:
+        std = float(np.std(points_history))
     else:
-        std = ep * 0.35  # fallback variance
+        std = ep_total * 0.35  # fallback variance
 
-    return ep, std
+    # Position-based variance adjustment
+    pos_std_mult = {"GK": 0.75, "DEF": 0.85, "MID": 1.0, "FWD": 1.1}
+    std *= pos_std_mult.get(pos, 1.0)
+
+    return ep_total, std
