@@ -44,6 +44,7 @@ Documentation is located in the `docs/` directory:
 - architecture.md — internal module structure  
 - api.md — CLI usage  
 - roadmap.md — planned improvements
+- testing.md — how to run pytest with custom team IDs
 
 ### AI Documentation (`docs/ai/`)
 - ai_captaincy.md  

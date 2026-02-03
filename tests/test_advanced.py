@@ -1,19 +1,18 @@
 from predictions.team_advanced import predict_team_points_advanced
 
 
-if __name__ == "__main__":
-    starting = [366, 8, 261, 407, 16, 119, 237, 414, 283, 249, 430]  # player ids
-    bench = [470, 242, 72, 347]
-    gw = 16
-
+def test_team_advanced_prediction(db_available, team_ids, bench_ids, gw, captain_id, vice_id):
     dist = predict_team_points_advanced(
-        starting=starting,
+        starting=team_ids,
         gw=gw,
-        captain_id=430,
-        vice_captain_id=16,
-        bench=bench,
+        captain_id=captain_id,
+        vice_captain_id=vice_id,
+        bench=bench_ids,
         triple_captain=False,
         bench_boost=False,
+        n_sims=2000,
     )
 
-    print(dist.summary())
+    summary = dist.summary()
+    assert summary["expected"] >= 0
+    assert summary["p25"] <= summary["p75"]
