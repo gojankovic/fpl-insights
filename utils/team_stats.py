@@ -4,6 +4,8 @@ import json
 
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import matplotlib
 matplotlib.use("Agg")  # headless backend za PNG
@@ -17,24 +19,44 @@ from db.sqlite import get_connection
 # API helpers
 # ---------------------------
 
-def api_entry(entry_id: int) -> dict:
-    resp = requests.get(f"https://fantasy.premierleague.com/api/entry/{entry_id}/")
+DEFAULT_TIMEOUT = 20
+
+
+def _requests_session(retries: int = 3) -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+_SESSION = _requests_session()
+
+
+def _get_json(url: str) -> dict:
+    resp = _SESSION.get(url, timeout=DEFAULT_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
+
+
+def api_entry(entry_id: int) -> dict:
+    return _get_json(f"https://fantasy.premierleague.com/api/entry/{entry_id}/")
 
 
 def api_history(entry_id: int) -> dict:
-    resp = requests.get(f"https://fantasy.premierleague.com/api/entry/{entry_id}/history/")
-    resp.raise_for_status()
-    return resp.json()
+    return _get_json(f"https://fantasy.premierleague.com/api/entry/{entry_id}/history/")
 
 
 def api_picks(entry_id: int, gw: int) -> dict:
-    resp = requests.get(
+    return _get_json(
         f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{gw}/picks/"
     )
-    resp.raise_for_status()
-    return resp.json()
 
 
 # ---------------------------

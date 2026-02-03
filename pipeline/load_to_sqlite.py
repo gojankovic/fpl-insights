@@ -2,8 +2,10 @@ from typing import Iterable, Tuple
 
 from db.sqlite import get_connection
 
-def replace_teams(rows: Iterable[Tuple]):
-    conn = get_connection()
+def replace_teams(rows: Iterable[Tuple], conn=None):
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM teams;")
     cur.executemany("""
@@ -15,12 +17,15 @@ def replace_teams(rows: Iterable[Tuple]):
             form, draw, win, loss, points, position, played
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, rows)
-    conn.commit()
-    conn.close()
+    if own_conn:
+        conn.commit()
+        conn.close()
 
 
-def replace_players(rows: Iterable[Tuple]):
-    conn = get_connection()
+def replace_players(rows: Iterable[Tuple], conn=None):
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM players;")
     cur.executemany("""
@@ -37,12 +42,15 @@ def replace_players(rows: Iterable[Tuple]):
             starts_per_90, clean_sheets_per_90
         )  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, rows)
-    conn.commit()
-    conn.close()
+    if own_conn:
+        conn.commit()
+        conn.close()
 
 
-def replace_events(rows: Iterable[Tuple]):
-    conn = get_connection()
+def replace_events(rows: Iterable[Tuple], conn=None):
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM events;")
     cur.executemany("""
@@ -51,12 +59,15 @@ def replace_events(rows: Iterable[Tuple]):
             finished, most_captained, most_transferred_in
         ) VALUES (?,?,?,?,?,?,?)
     """, rows)
-    conn.commit()
-    conn.close()
+    if own_conn:
+        conn.commit()
+        conn.close()
 
 
-def replace_fixtures(rows: Iterable[Tuple]):
-    conn = get_connection()
+def replace_fixtures(rows: Iterable[Tuple], conn=None):
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM fixtures;")
     cur.executemany("""
@@ -65,12 +76,15 @@ def replace_fixtures(rows: Iterable[Tuple]):
             difficulty_home, difficulty_away, finished, kickoff_time
         ) VALUES (?,?,?,?,?,?,?,?,?,?)
     """, rows)
-    conn.commit()
-    conn.close()
+    if own_conn:
+        conn.commit()
+        conn.close()
 
 
-def replace_player_history(rows: Iterable[Tuple]):
-    conn = get_connection()
+def replace_player_history(rows: Iterable[Tuple], conn=None):
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM player_history;")
     cur.executemany("""
@@ -81,5 +95,6 @@ def replace_player_history(rows: Iterable[Tuple]):
             transfers_in, transfers_out, kickoff_time
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, rows)
-    conn.commit()
-    conn.close()
+    if own_conn:
+        conn.commit()
+        conn.close()

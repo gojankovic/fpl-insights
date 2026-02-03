@@ -28,7 +28,7 @@ def captaincy_advice(entry_id: int, gw: int) -> Dict[str, Any]:
     - builds compact team context,
     - asks LLM for captaincy advice.
     """
-    team_ctx = build_team_json(entry_id)
+    team_ctx = build_team_json(entry_id, target_gw=gw)
     squad = build_squad_for_gw(entry_id, gw)
 
     use_gw = squad[0]["last_gw_used"] if squad else gw - 1
@@ -70,7 +70,7 @@ def transfer_advice(
     - Ask LLM
     - Validate output (position, budget, 3-per-club)
     """
-    team_ctx = build_team_json(entry_id)
+    team_ctx = build_team_json(entry_id, target_gw=gw)
     squad_state = build_squad_state(entry_id, gw, free_transfers, allowed_extra)
     pool_full = build_candidate_pool(limit=candidate_pool_size, gw=gw)
     pool_reduced = reduce_candidate_pool_for_transfers(squad_state, pool_full)
@@ -201,5 +201,4 @@ def extract_latest_gw_squad(team_json):
         "captain_id": last["team"]["captain_id"],
         "vice_id": last["team"]["vice_id"]
     }
-
 

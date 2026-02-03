@@ -283,7 +283,7 @@ def build_transfer_prompt(
     """
 
     free_tf = squad_state.get("free_transfers", 1)
-    allowed_extra = squad_state.get("allowed_extra_transfers", 1)
+    allowed_extra = squad_state.get("allowed_extra", 0)
 
     return (
         "You are an advanced FPL transfer analyst.\n\n"

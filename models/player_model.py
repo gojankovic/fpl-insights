@@ -73,7 +73,7 @@ def predict_player_points(player_id: int, gw: int) -> Tuple[float, float]:
     if p["status"] in ("i", "o"):  # injured/out
         exp_minutes = 0
     else:
-        exp_minutes = 80 if p["starts"] >= 3 else 60
+        exp_minutes = 80 if (p.get("starts") or 0) >= 3 else 60
 
     # Base EP components
     ppg = p["points_per_game"] or 0

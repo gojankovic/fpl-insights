@@ -191,6 +191,7 @@ def build_squad_for_gw(entry_id: int, gw: int) -> List[Dict[str, Any]]:
                     "is_vice": pid == gw_block["team"]["vice_id"],
                     "multiplier": 2 if pid == gw_block["team"]["captain_id"] else 1,
                     "last_gw_used": use_gw,
+                    "is_starting": section == "starting",
                 }
             )
 
@@ -218,11 +219,11 @@ def get_team_fdr(team_id: int, gw_start: int, next_n: int = 5) -> Dict[str, Any]
         """
         SELECT event, team_h, team_a, difficulty_home, difficulty_away
         FROM fixtures
-        WHERE event >= ?
+        WHERE event >= ? AND (team_h = ? OR team_a = ?)
         ORDER BY event ASC
         LIMIT ?
         """,
-        (gw_start, next_n),
+        (gw_start, team_id, team_id, next_n),
     )
 
     rows = cur.fetchall()
@@ -336,7 +337,7 @@ def estimate_rotation_risk(history: List[Dict[str, Any]]) -> str:
 # -------------------------------------------------
 
 
-def build_team_json(entry_id: int) -> Dict[str, Any]:
+def build_team_json(entry_id: int, target_gw: Optional[int] = None) -> Dict[str, Any]:
     """
     Build a compact team context for AI prompts.
 
@@ -348,7 +349,13 @@ def build_team_json(entry_id: int) -> Dict[str, Any]:
     if not gw_data:
         raise ValueError("team_stats.json has empty gw_data.")
 
-    last_gw_block = max(gw_data, key=lambda g: g["gw"])
+    if target_gw is None:
+        last_gw_block = max(gw_data, key=lambda g: g["gw"])
+    else:
+        past_gws = [g for g in gw_data if g.get("gw") is not None and g["gw"] < target_gw]
+        last_gw_block = max(past_gws, key=lambda g: g["gw"]) if past_gws else max(
+            gw_data, key=lambda g: g["gw"]
+        )
 
     return {
         "entry_id": raw.get("entry_id", entry_id),
@@ -447,6 +454,7 @@ def build_squad_state(entry_id: int, target_gw: int, free_transfers: int, allowe
 
     return {
         "allowed_extra": allowed_extra,
+        "allowed_extra_transfers": allowed_extra,
         "free_transfers": free_transfers,
         "bank": bank,
         "squad": squad,

@@ -53,6 +53,8 @@ def calc_expected_points(entry_id: int, gw: int) -> float:
     # 2) Compute mean expectation per player
     # ============================================
     for p in squad:
+        if not p.get("is_starting", False):
+            continue
         base = _player_expected_points(p["id"], last_n=5)
 
         # Basic minutes adjustment:

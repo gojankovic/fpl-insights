@@ -110,7 +110,7 @@ def simulate_team(player_ids, gw, n_sims=10000):
 if __name__ == "__main__":
     #my team
     team = [366, 8, 261, 407, 16, 119, 237, 414, 283, 249, 430]
-    gw = 14
+    gw = 18
 
     samples = simulate_team(team, gw)
 
