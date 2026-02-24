@@ -1,9 +1,55 @@
 import sqlite3
+import json
+from pathlib import Path
 from typing import Tuple, List, Dict, Optional
 
 import numpy as np
 
 from config import DB_PATH
+
+PARAMS_PATH = Path(__file__).resolve().parent / "player_model_params.json"
+
+DEFAULT_MODEL_PARAMS: Dict[str, float] = {
+    "history_recent_n": 6,
+    "history_long_n": 60,
+    "recent_decay": 0.83,
+    "w_season": 0.55,
+    "w_recent": 0.30,
+    "w_anchor": 0.15,
+    "shrink_k": 10.0,
+    "xgi_weight_gk": 0.00,
+    "xgi_weight_def": 0.02,
+    "xgi_weight_mid": 0.05,
+    "xgi_weight_fwd": 0.08,
+    "fixture_w_gk": 0.12,
+    "fixture_w_def": 0.16,
+    "fixture_w_mid": 0.20,
+    "fixture_w_fwd": 0.24,
+    "dgw_minutes_factor": 0.82,
+    "std_floor": 0.50,
+    "std_fallback_mult": 0.35,
+}
+
+_PARAMS_CACHE: Optional[Dict[str, float]] = None
+
+
+def _get_model_params() -> Dict[str, float]:
+    global _PARAMS_CACHE
+    if _PARAMS_CACHE is not None:
+        return _PARAMS_CACHE
+
+    params = dict(DEFAULT_MODEL_PARAMS)
+    if PARAMS_PATH.exists():
+        try:
+            raw = json.loads(PARAMS_PATH.read_text(encoding="utf-8"))
+            for k, v in raw.items():
+                if k in params:
+                    params[k] = float(v)
+        except Exception:
+            pass
+
+    _PARAMS_CACHE = params
+    return params
 
 def get_player_data(player_id: int) -> dict:
     conn = sqlite3.connect(DB_PATH)
@@ -198,14 +244,23 @@ def get_player_position(player_id: int) -> str:
     return pos_map.get(row["element_type"], "MID")
 
 
-def predict_player_points(player_id: int, gw: int) -> Tuple[float, float]:
+def predict_player_points(
+    player_id: int,
+    gw: int,
+    params: Optional[Dict[str, float]] = None,
+) -> Tuple[float, float]:
     """
     Returns (mean, std) points expectation for player in a given GW.
     """
+    cfg = params or _get_model_params()
     p = get_player_data(player_id)
     # Time-sliced history: for GW X, use only data up to GW X-1.
-    history_all = get_player_history(player_id, last_n=60, up_to_gw=gw)
-    history_recent = history_all[:6]
+    history_all = get_player_history(
+        player_id,
+        last_n=int(cfg.get("history_long_n", 60)),
+        up_to_gw=gw,
+    )
+    history_recent = history_all[:int(cfg.get("history_recent_n", 6))]
 
     # Expected minutes for upcoming GW
     exp_minutes = _estimate_expected_minutes(p, history_recent)
@@ -218,21 +273,34 @@ def predict_player_points(player_id: int, gw: int) -> Tuple[float, float]:
         float(sum(season_points)) / len(season_points)
         if season_points else float(p.get("points_per_game") or 0.0)
     )
-    recent_ppg = _weighted_mean(recent_points, decay=0.83) if recent_points else season_ppg_asof
+    recent_ppg = _weighted_mean(
+        recent_points,
+        decay=float(cfg.get("recent_decay", 0.83)),
+    ) if recent_points else season_ppg_asof
     anchor_ppg = float(p.get("points_per_game") or season_ppg_asof)
 
     # Blend season signal + recent trend with a light anchor to bootstrap.
-    raw_ep = 0.55 * season_ppg_asof + 0.30 * recent_ppg + 0.15 * anchor_ppg
+    raw_ep = (
+        float(cfg.get("w_season", 0.55)) * season_ppg_asof
+        + float(cfg.get("w_recent", 0.30)) * recent_ppg
+        + float(cfg.get("w_anchor", 0.15)) * anchor_ppg
+    )
 
     # Bayesian-style shrinkage toward position prior for stability.
     pos = _position(p)
     pos_prior = {"GK": 3.4, "DEF": 3.8, "MID": 4.9, "FWD": 5.2}
     n_games = len(season_points)
-    shrink = n_games / (n_games + 10.0)
+    shrink_k = max(1e-6, float(cfg.get("shrink_k", 10.0)))
+    shrink = n_games / (n_games + shrink_k)
     base_ep = shrink * raw_ep + (1.0 - shrink) * pos_prior.get(pos, 4.5)
 
     # xGI bonus scaled by position
-    xgi_weight = {"GK": 0.00, "DEF": 0.02, "MID": 0.05, "FWD": 0.08}
+    xgi_weight = {
+        "GK": float(cfg.get("xgi_weight_gk", 0.00)),
+        "DEF": float(cfg.get("xgi_weight_def", 0.02)),
+        "MID": float(cfg.get("xgi_weight_mid", 0.05)),
+        "FWD": float(cfg.get("xgi_weight_fwd", 0.08)),
+    }
     xgi_trust = min(1.0, n_games / 8.0)
     base_ep += _xgi_per90(p) * xgi_weight.get(pos, 0.05) * xgi_trust
 
@@ -243,12 +311,17 @@ def predict_player_points(player_id: int, gw: int) -> Tuple[float, float]:
 
     minutes_per_fixture = exp_minutes
     if len(difficulties) > 1:
-        minutes_per_fixture = exp_minutes * 0.82
+        minutes_per_fixture = exp_minutes * float(cfg.get("dgw_minutes_factor", 0.82))
     minutes_factor = min(minutes_per_fixture, 90.0) / 90.0
 
     ep_total = 0.0
     # Stronger fixture impact so opponent quality matters more.
-    fixture_weight_by_pos = {"GK": 0.12, "DEF": 0.16, "MID": 0.20, "FWD": 0.24}
+    fixture_weight_by_pos = {
+        "GK": float(cfg.get("fixture_w_gk", 0.12)),
+        "DEF": float(cfg.get("fixture_w_def", 0.16)),
+        "MID": float(cfg.get("fixture_w_mid", 0.20)),
+        "FWD": float(cfg.get("fixture_w_fwd", 0.24)),
+    }
     fixture_weight = fixture_weight_by_pos.get(pos, 0.18)
     for difficulty in difficulties:
         adj = 1 + (3 - difficulty) * fixture_weight
@@ -259,10 +332,10 @@ def predict_player_points(player_id: int, gw: int) -> Tuple[float, float]:
     if len(points_history) >= 3:
         std = float(np.std(points_history))
     else:
-        std = ep_total * 0.35  # fallback variance
+        std = ep_total * float(cfg.get("std_fallback_mult", 0.35))  # fallback variance
 
     # Position-based variance adjustment
     pos_std_mult = {"GK": 0.75, "DEF": 0.85, "MID": 1.0, "FWD": 1.1}
     std *= pos_std_mult.get(pos, 1.0)
 
-    return max(ep_total, 0.0), max(std, 0.5)
+    return max(ep_total, 0.0), max(std, float(cfg.get("std_floor", 0.5)))

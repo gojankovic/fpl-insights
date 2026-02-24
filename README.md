@@ -104,6 +104,12 @@ python predictions/predict_players.py --gw-from 28 --gw-to 35 --top 10 --pool 25
 Backtest predicted vs actual:
 python predictions/backtest_player_model.py --gw-from 20 --gw-to 27
 
+Calibrate model params (grid search on historical GW sample):
+python predictions/calibrate_player_model.py --gw-from 12 --gw-to 27 --sample-size 1200
+
+Write best params to model config:
+python predictions/calibrate_player_model.py --gw-from 12 --gw-to 27 --sample-size 1200 --write
+
 ## Notes
 
 FPLInsights is designed for extensibility.  
