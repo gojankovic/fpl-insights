@@ -25,6 +25,27 @@ DEFAULT_MODEL_PARAMS: Dict[str, float] = {
     "fixture_w_def": 0.16,
     "fixture_w_mid": 0.20,
     "fixture_w_fwd": 0.24,
+    "fixture_role_floor_mid": 0.55,
+    "fixture_role_floor_fwd": 0.70,
+    "fixture_role_ref_mid": 0.70,
+    "fixture_role_ref_fwd": 0.85,
+    "fixture_role_cap": 1.15,
+    "elite_uplift_mid_max": 0.14,
+    "elite_uplift_fwd_max": 0.14,
+    "elite_xgi_ref_mid": 0.70,
+    "elite_xgi_ref_fwd": 0.90,
+    "elite_xgi_floor_mid": 0.18,
+    "elite_xgi_floor_fwd": 0.30,
+    "elite_ppg_ref_mid": 6.0,
+    "elite_ppg_ref_fwd": 7.0,
+    "elite_starts_ref": 12.0,
+    "elite_n_games_ref": 10.0,
+    "set_piece_uplift_mid_max": 0.08,
+    "set_piece_xa90_ref": 0.25,
+    "set_piece_crea90_ref": 35.0,
+    "set_piece_xa90_floor": 0.12,
+    "set_piece_crea90_floor": 16.0,
+    "set_piece_min_starts": 8.0,
     "dgw_minutes_factor": 0.82,
     "std_floor": 0.50,
     "std_fallback_mult": 0.35,
@@ -231,6 +252,15 @@ def _position(player: dict) -> str:
     return pos_map.get(player.get("element_type"), "MID")
 
 
+def _safe_float(value: Optional[float], default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def get_player_position(player_id: int) -> str:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -295,6 +325,7 @@ def predict_player_points(
     base_ep = shrink * raw_ep + (1.0 - shrink) * pos_prior.get(pos, 4.5)
 
     # xGI bonus scaled by position
+    xgi90 = _xgi_per90(p)
     xgi_weight = {
         "GK": float(cfg.get("xgi_weight_gk", 0.00)),
         "DEF": float(cfg.get("xgi_weight_def", 0.02)),
@@ -302,7 +333,41 @@ def predict_player_points(
         "FWD": float(cfg.get("xgi_weight_fwd", 0.08)),
     }
     xgi_trust = min(1.0, n_games / 8.0)
-    base_ep += _xgi_per90(p) * xgi_weight.get(pos, 0.05) * xgi_trust
+    base_ep += xgi90 * xgi_weight.get(pos, 0.05) * xgi_trust
+
+    # Expand premium attacker ceiling without inflating low-sample outliers.
+    starts = _safe_float(p.get("starts"), 0.0)
+    sample_trust = min(1.0, n_games / max(1e-6, float(cfg.get("elite_n_games_ref", 10.0))))
+    start_trust = min(1.0, starts / max(1e-6, float(cfg.get("elite_starts_ref", 12.0))))
+    elite_trust = sample_trust * start_trust
+    if pos in ("MID", "FWD") and elite_trust > 0:
+        xgi_ref = float(cfg.get("elite_xgi_ref_mid" if pos == "MID" else "elite_xgi_ref_fwd", 0.70 if pos == "MID" else 0.90))
+        ppg_ref = float(cfg.get("elite_ppg_ref_mid" if pos == "MID" else "elite_ppg_ref_fwd", 6.0 if pos == "MID" else 7.0))
+        elite_max = float(cfg.get("elite_uplift_mid_max" if pos == "MID" else "elite_uplift_fwd_max", 0.20 if pos == "MID" else 0.18))
+        xgi_floor = float(cfg.get("elite_xgi_floor_mid" if pos == "MID" else "elite_xgi_floor_fwd", 0.18 if pos == "MID" else 0.30))
+        xgi_score = 0.0
+        if xgi90 > xgi_floor:
+            xgi_score = min(1.0, (xgi90 - xgi_floor) / max(1e-6, (xgi_ref - xgi_floor)))
+        ppg_score = min(1.0, anchor_ppg / max(1e-6, ppg_ref))
+        elite_score = 0.70 * xgi_score + 0.30 * ppg_score
+        base_ep *= 1.0 + elite_max * elite_score * elite_trust
+
+    # Creator/set-piece proxy for attacking mids.
+    if pos == "MID" and starts >= float(cfg.get("set_piece_min_starts", 8.0)):
+        minutes_total = max(1.0, _safe_float(p.get("minutes"), 0.0))
+        xa90 = _safe_float(p.get("expected_assists_per_90"), 0.0)
+        creativity_total = _safe_float(p.get("creativity"), 0.0)
+        creativity90 = creativity_total / minutes_total * 90.0
+        xa_floor = float(cfg.get("set_piece_xa90_floor", 0.12))
+        crea_floor = float(cfg.get("set_piece_crea90_floor", 16.0))
+        xa_score = 0.0
+        if xa90 > xa_floor:
+            xa_score = min(1.0, (xa90 - xa_floor) / max(1e-6, float(cfg.get("set_piece_xa90_ref", 0.25)) - xa_floor))
+        crea_score = 0.0
+        if creativity90 > crea_floor:
+            crea_score = min(1.0, (creativity90 - crea_floor) / max(1e-6, float(cfg.get("set_piece_crea90_ref", 35.0)) - crea_floor))
+        creator_score = 0.65 * xa_score + 0.35 * crea_score
+        base_ep *= 1.0 + float(cfg.get("set_piece_uplift_mid_max", 0.12)) * creator_score * elite_trust
 
     # Fixture adjustment (supports DGW)
     difficulties = get_player_fixtures_in_gw(player_id, gw)
@@ -323,6 +388,29 @@ def predict_player_points(
         "FWD": float(cfg.get("fixture_w_fwd", 0.24)),
     }
     fixture_weight = fixture_weight_by_pos.get(pos, 0.18)
+
+    # MID/FWD fixture sensitivity should depend on attacking profile.
+    # This avoids overrating low-xGI midfielders just because they have an easy fixture.
+    if pos in ("MID", "FWD"):
+        role_floor = float(
+            cfg.get(
+                "fixture_role_floor_mid" if pos == "MID" else "fixture_role_floor_fwd",
+                0.55 if pos == "MID" else 0.70,
+            )
+        )
+        role_ref = max(
+            1e-6,
+            float(
+                cfg.get(
+                    "fixture_role_ref_mid" if pos == "MID" else "fixture_role_ref_fwd",
+                    0.70 if pos == "MID" else 0.85,
+                )
+            ),
+        )
+        role_cap = max(1.0, float(cfg.get("fixture_role_cap", 1.15)))
+        role_mult = role_floor + (1.0 - role_floor) * min(1.0, max(0.0, xgi90) / role_ref)
+        fixture_weight *= min(role_mult, role_cap)
+
     for difficulty in difficulties:
         adj = 1 + (3 - difficulty) * fixture_weight
         ep_total += base_ep * minutes_factor * adj

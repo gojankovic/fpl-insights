@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import time
+from datetime import datetime, timezone
 
 from db.sqlite import init_db, get_connection
 from pipeline.fetch import (
@@ -15,6 +16,9 @@ from pipeline.normalize import (
     normalize_events,
     normalize_fixtures,
     normalize_player_history,
+    normalize_player_fixtures,
+    normalize_player_history_past,
+    normalize_player_gw_snapshot,
 )
 from pipeline.load_to_sqlite import (
     replace_teams,
@@ -22,6 +26,9 @@ from pipeline.load_to_sqlite import (
     replace_events,
     replace_fixtures,
     replace_player_history,
+    replace_player_fixtures,
+    replace_player_history_past,
+    append_player_gw_snapshot,
 )
 from pipeline.schema_checker import check_schema_change
 
@@ -48,6 +55,8 @@ def update_fpl_data():
     players_rows = normalize_players(bootstrap)
     events_rows = normalize_events(bootstrap)
     fixtures_rows = normalize_fixtures(fixtures_raw)
+    snapshot_time = datetime.now(timezone.utc).isoformat()
+    snapshot_rows = normalize_player_gw_snapshot(bootstrap, snapshot_time=snapshot_time)
 
     conn = get_connection()
     try:
@@ -64,17 +73,28 @@ def update_fpl_data():
         print("Writing fixtures...")
         replace_fixtures(fixtures_rows, conn=conn)
 
+        print("Writing player GW snapshot...")
+        append_player_gw_snapshot(snapshot_rows, conn=conn)
+
         print("Fetching player history (this might take a while)...")
         all_history_rows = []
+        all_player_fixtures_rows = []
+        all_history_past_rows = []
         session = create_session()
         for p in bootstrap["elements"]:
             pid = p["id"]
             summary = fetch_player_summary(pid, session=session)
             all_history_rows.extend(normalize_player_history(pid, summary))
+            all_player_fixtures_rows.extend(normalize_player_fixtures(pid, summary))
+            all_history_past_rows.extend(normalize_player_history_past(pid, summary))
             time.sleep(0.1)
 
         print("Writing player history...")
         replace_player_history(all_history_rows, conn=conn)
+        print("Writing player fixtures...")
+        replace_player_fixtures(all_player_fixtures_rows, conn=conn)
+        print("Writing player history past...")
+        replace_player_history_past(all_history_past_rows, conn=conn)
 
         conn.commit()
     finally:
