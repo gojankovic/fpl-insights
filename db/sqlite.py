@@ -320,5 +320,19 @@ def init_db():
     );
     """)
 
+    # Performance indexes for prediction/backtest queries.
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_players_team_id ON players(team_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_finished ON events(finished)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_fixtures_event ON fixtures(event)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_fixtures_team_h_event ON fixtures(team_h, event)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_fixtures_team_a_event ON fixtures(team_a, event)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_player_history_player_gw ON player_history(player_id, gameweek)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_player_history_gw ON player_history(gameweek)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_player_fixtures_player_event ON player_fixtures(player_id, event)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_player_fixtures_fixture_id ON player_fixtures(fixture_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_player_history_past_player ON player_history_past(player_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_player_gw_snapshot_player_time ON player_gw_snapshot(player_id, snapshot_time)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_player_gw_snapshot_event ON player_gw_snapshot(current_event, next_event)")
+
     conn.commit()
     conn.close()
