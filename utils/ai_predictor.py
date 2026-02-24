@@ -335,6 +335,12 @@ def build_transfer_prompt(
         "- nailed starter\n"
         "- good fixture run (low FDR)\n\n"
 
+        "SELECTION PRIORITY (IMPORTANT):\n"
+        "- Prioritise transfers that improve the likely STARTING XI for this GW.\n"
+        "- Use `squad_state.squad[].is_starting` and minutes/rotation flags to identify starters.\n"
+        "- Avoid bench-to-bench luxury moves unless there is no meaningful starting XI improvement.\n"
+        "- If selling a bench player, the incoming player should be likely to play meaningful minutes.\n\n"
+
         "OUTPUT FORMAT (STRICT JSON):\n"
         "{\n"
         "  gameweek: number,\n"

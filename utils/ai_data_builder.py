@@ -428,6 +428,7 @@ def build_squad_state(entry_id: int, target_gw: int, free_transfers: int, allowe
                 "name": p["name"],
                 "team": team,
                 "pos": p["pos"],
+                "is_starting": p.get("is_starting", False),
                 "recent_form": average_last_n(history, 3),
                 "expected_minutes": history[-1]["minutes"] if history else 0,
                 "rotation_risk": estimate_rotation_risk(history),

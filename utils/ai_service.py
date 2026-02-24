@@ -80,23 +80,44 @@ def transfer_advice(
         f"using last completed squad & bank from team_stats.json."
     )
 
-    prompt = build_transfer_prompt(gw, team_ctx, squad_state, pool_reduced)
-    rsp = ask_llm(prompt)
+    base_prompt = build_transfer_prompt(gw, team_ctx, squad_state, pool_reduced)
+    prompt = base_prompt
 
-    if rsp["error"]:
-        return {
-            "error": rsp["error"],
-            "raw": rsp["raw"],
-        }
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        rsp = ask_llm(prompt)
 
-    # Validate the suggestion
-    sanitized = sanitize_llm_transfer_output(
-        rsp["json"],
-        squad_state,
-        pool_reduced,
-    )
+        if rsp["error"]:
+            return {
+                "error": rsp["error"],
+                "raw": rsp["raw"],
+            }
 
-    return sanitized
+        sanitized = sanitize_llm_transfer_output(
+            rsp["json"],
+            squad_state,
+            pool_reduced,
+        )
+
+        if not sanitized.get("error"):
+            return sanitized
+
+        if attempt == max_attempts:
+            return sanitized
+
+        prompt = (
+            f"{base_prompt}\n\n"
+            "IMPORTANT: Your previous proposal was invalid.\n"
+            f"Validation error: {sanitized['error']}\n\n"
+            "Regenerate a new proposal from scratch.\n"
+            "Focus on improving the likely starting XI first; avoid bench-only luxury moves.\n"
+            "Return only valid JSON in the required format."
+        )
+
+    return {
+        "error": "Could not generate a valid transfer suggestion.",
+        "raw": None,
+    }
 
 
 # -------------------------------------------------
@@ -201,4 +222,3 @@ def extract_latest_gw_squad(team_json):
         "captain_id": last["team"]["captain_id"],
         "vice_id": last["team"]["vice_id"]
     }
-
