@@ -331,12 +331,16 @@ def build_transfer_prompt(
         "- poor upcoming fixtures (high FDR)\n\n"
 
         "WHEN TO BUY:\n"
-        "- strong form, reliable minutes\n"
+        "- strong projected points for target GW (`predicted_points_gw`)\n"
+        "- strong fixture-adjusted value (`fixture_adjusted_points`)\n"
+        "- favorable next fixtures (`fdr_next5.avg_fdr` lower is better)\n"
+        "- reliable minutes\n"
         "- nailed starter\n"
         "- good fixture run (low FDR)\n\n"
 
         "SELECTION PRIORITY (IMPORTANT):\n"
         "- Prioritise transfers that improve the likely STARTING XI for this GW.\n"
+        "- Base decisions on projected points + fixture run, not only recent form.\n"
         "- Use `squad_state.squad[].is_starting` and minutes/rotation flags to identify starters.\n"
         "- Avoid bench-to-bench luxury moves unless there is no meaningful starting XI improvement.\n"
         "- If selling a bench player, the incoming player should be likely to play meaningful minutes.\n\n"

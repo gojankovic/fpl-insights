@@ -3,6 +3,7 @@ import json
 from typing import Dict, Any, List, Optional
 
 from db.sqlite import get_connection
+from models.player_model import predict_player_points
 
 
 # -------------------------------------------------
@@ -407,7 +408,7 @@ def build_squad_state(entry_id: int, target_gw: int, free_transfers: int, allowe
 
         cur.execute(
             """
-            SELECT now_cost, status, chance_of_playing_next_round
+            SELECT now_cost, status, chance_of_playing_next_round, team_id
             FROM players
             WHERE id = ?
             """,
@@ -418,9 +419,27 @@ def build_squad_state(entry_id: int, target_gw: int, free_transfers: int, allowe
         price = row["now_cost"] if row else None
         status = row["status"] if row else "a"
         chance = row["chance_of_playing_next_round"] if row else None
+        team_id = row["team_id"] if row else None
 
         injured = status == "i"
         suspended = status == "s"
+        try:
+            predicted_points_gw = float(predict_player_points(pid, target_gw)[0])
+        except Exception:
+            predicted_points_gw = 0.0
+
+        fdr_info = get_team_fdr(team_id, gw_start=target_gw, next_n=5) if team_id else {
+            "avg_fdr": None,
+            "fixtures": [],
+            "raw_values": [],
+        }
+        avg_fdr = fdr_info.get("avg_fdr")
+        if avg_fdr is None:
+            fixture_multiplier = 1.0
+        else:
+            fixture_multiplier = 1 + (3.0 - float(avg_fdr)) * 0.12
+            fixture_multiplier = max(0.7, min(1.3, fixture_multiplier))
+        fixture_adjusted_points = predicted_points_gw * fixture_multiplier
 
         squad.append(
             {
@@ -437,6 +456,8 @@ def build_squad_state(entry_id: int, target_gw: int, free_transfers: int, allowe
                 "chance_of_playing_next_round": chance,
                 "injury": injured,
                 "suspended": suspended,
+                "predicted_points_gw": predicted_points_gw,
+                "fixture_adjusted_points": fixture_adjusted_points,
             }
         )
 
@@ -533,6 +554,22 @@ def build_candidate_pool(limit: int = 120, gw: Optional[int] = None) -> List[Dic
         suspended = status == "s"
 
         fdr_info = get_team_fdr(r["team_id"], gw_start=gw, next_n=5)
+        avg_fdr = fdr_info.get("avg_fdr")
+
+        try:
+            predicted_points_gw = float(predict_player_points(pid, gw)[0])
+        except Exception:
+            predicted_points_gw = 0.0
+
+        # Blend short-term model output with upcoming fixture run.
+        # Easier run (avg_fdr < 3) increases expected value.
+        if avg_fdr is None:
+            fixture_multiplier = 1.0
+        else:
+            fixture_multiplier = 1 + (3.0 - float(avg_fdr)) * 0.12
+            fixture_multiplier = max(0.7, min(1.3, fixture_multiplier))
+
+        fixture_adjusted_points = predicted_points_gw * fixture_multiplier
 
         pool.append(
             {
@@ -550,6 +587,8 @@ def build_candidate_pool(limit: int = 120, gw: Optional[int] = None) -> List[Dic
                 "suspended": suspended,
                 "rotation_risk": rotation,
                 "fdr_next5": fdr_info,
+                "predicted_points_gw": predicted_points_gw,
+                "fixture_adjusted_points": fixture_adjusted_points,
                 "recent_history": history[-6:],
             }
         )
@@ -618,6 +657,8 @@ def reduce_candidate_pool_for_transfers(
             key=lambda x: (
                 rotation_priority.get(x.get("rotation_risk", "unknown"), 1),
                 -(x.get("expected_minutes") or 0),
+                -(x.get("fixture_adjusted_points") or 0.0),
+                -(x.get("predicted_points_gw") or 0.0),
                 -(x.get("form_last3") or 0.0),
                 -(x.get("total_points") or 0),
             ),

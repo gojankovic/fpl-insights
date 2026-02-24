@@ -7,6 +7,45 @@ from utils.ai_transfer_validator import (
 )
 
 
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_forced_sell(player: Dict[str, Any]) -> bool:
+    status = str(player.get("status") or "").lower()
+    if status in {"i", "s", "u", "o"}:
+        return True
+
+    chance = _coerce_float(player.get("chance_of_playing_next_round"))
+    if chance is not None and chance <= 50:
+        return True
+
+    exp_mins = _coerce_float(player.get("expected_minutes"))
+    if exp_mins is not None and exp_mins <= 25:
+        return True
+
+    return False
+
+
+def _get_projection_score(player: Dict[str, Any]) -> float | None:
+    return (
+        _coerce_float(player.get("fixture_adjusted_points"))
+        or _coerce_float(player.get("predicted_points_gw"))
+    )
+
+
+def _find_player(players: List[Dict[str, Any]], player_id: Any) -> Dict[str, Any] | None:
+    for p in players:
+        if p.get("id") == player_id:
+            return p
+    return None
+
+
 def sanitize_llm_transfer_output(
     llm_json: Dict[str, Any],
     squad_state: Dict[str, Any],
@@ -104,6 +143,26 @@ def sanitize_llm_transfer_output(
                 "error": f"Invalid transfer #{idx}: {reason}",
                 "raw": llm_json,
             }
+
+        out_player = _find_player(state["squad"], suggestion.get("out_id"))
+        in_player = _find_player(candidate_pool, suggestion.get("in_id"))
+        if out_player is None or in_player is None:
+            return {
+                "error": f"Invalid transfer #{idx}: could not resolve players for projection check.",
+                "raw": llm_json,
+            }
+
+        if not _is_forced_sell(out_player):
+            out_score = _get_projection_score(out_player)
+            in_score = _get_projection_score(in_player)
+            if out_score is not None and in_score is not None and in_score <= out_score + 0.05:
+                return {
+                    "error": (
+                        f"Invalid transfer #{idx}: incoming projection must improve "
+                        f"the outgoing one ({in_score:.2f} <= {out_score:.2f})."
+                    ),
+                    "raw": llm_json,
+                }
 
         applied, apply_reason = apply_transfer_suggestion(state, suggestion, candidate_pool)
         if not applied:

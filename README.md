@@ -95,6 +95,9 @@ python ai.py h2h --teamA <id> --teamB <id> --gw <gw>
 With Monte Carlo baseline:
 python ai.py h2h --teamA <id> --teamB <id> --gw <gw> --mc
 
+### Top players dashboard (predicted points)
+python predictions/predict_players.py --gw <gw> --top 10 --sims 5000
+
 ## Notes
 
 FPLInsights is designed for extensibility.  
