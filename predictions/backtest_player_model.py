@@ -57,10 +57,15 @@ def _load_eval_rows(gw_from: int, gw_to: int) -> List[Dict[str, Any]]:
 
 def _metrics(rows: List[Tuple[float, float]]) -> Dict[str, float]:
     if not rows:
-        return {"mae": 0.0, "rmse": 0.0, "bias": 0.0}
-    errors = np.array([pred - actual for pred, actual in rows], dtype=float)
+        return {"mae": 0.0, "mar": 0.0, "rmse": 0.0, "bias": 0.0}
+    preds = np.array([pred for pred, _ in rows], dtype=float)
+    actuals = np.array([actual for _, actual in rows], dtype=float)
+    errors = preds - actuals
+    nonzero_mask = actuals > 0
+    mar_base = np.abs(errors[nonzero_mask]) if np.any(nonzero_mask) else np.abs(errors)
     return {
         "mae": float(np.mean(np.abs(errors))),
+        "mar": float(np.median(mar_base)),
         "rmse": float(np.sqrt(np.mean(errors ** 2))),
         "bias": float(np.mean(errors)),
     }
@@ -106,14 +111,15 @@ def render(result: Dict[str, Any], gw_from: int, gw_to: int):
     t = Table(title=title)
     t.add_column("Scope")
     t.add_column("MAE", justify="right")
+    t.add_column("MAR", justify="right")
     t.add_column("RMSE", justify="right")
     t.add_column("Bias", justify="right")
 
     ov = result["overall"]
-    t.add_row("ALL", f"{ov['mae']:.3f}", f"{ov['rmse']:.3f}", f"{ov['bias']:.3f}")
+    t.add_row("ALL", f"{ov['mae']:.3f}", f"{ov['mar']:.3f}", f"{ov['rmse']:.3f}", f"{ov['bias']:.3f}")
     for pos in ["GK", "DEF", "MID", "FWD"]:
         m = result["by_pos"][pos]
-        t.add_row(pos, f"{m['mae']:.3f}", f"{m['rmse']:.3f}", f"{m['bias']:.3f}")
+        t.add_row(pos, f"{m['mae']:.3f}", f"{m['mar']:.3f}", f"{m['rmse']:.3f}", f"{m['bias']:.3f}")
     console.print(t)
 
     w = Table(title="Worst 15 Misses")

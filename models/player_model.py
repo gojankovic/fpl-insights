@@ -46,12 +46,22 @@ DEFAULT_MODEL_PARAMS: Dict[str, float] = {
     "set_piece_xa90_floor": 0.12,
     "set_piece_crea90_floor": 16.0,
     "set_piece_min_starts": 8.0,
+    "start_rate_minutes_floor": 0.65,
+    "start_rate_minutes_cap": 1.08,
+    "transfer_balance_scale": 4.0,
+    "transfer_balance_cap": 0.08,
+    "selected_trend_scale": 0.25,
+    "selected_trend_cap": 0.08,
+    "value_delta_scale": 0.015,
+    "value_delta_cap": 0.10,
+    "ep_next_weight_future": 0.08,
     "dgw_minutes_factor": 0.82,
     "std_floor": 0.50,
     "std_fallback_mult": 0.35,
 }
 
 _PARAMS_CACHE: Optional[Dict[str, float]] = None
+_MAX_HISTORY_GW_CACHE: Optional[int] = None
 
 
 def _get_model_params() -> Dict[str, float]:
@@ -118,7 +128,8 @@ def get_player_history(
 
     if up_to_gw is None:
         c.execute("""
-        SELECT gameweek, total_points, minutes, goals_scored, assists, clean_sheets, bonus_points
+        SELECT gameweek, total_points, minutes, goals_scored, assists, clean_sheets, bonus_points,
+               starts, selected, transfers_balance, value
         FROM player_history
         WHERE player_id = ?
         ORDER BY gameweek DESC
@@ -126,7 +137,8 @@ def get_player_history(
     """, (player_id, last_n))
     else:
         c.execute("""
-        SELECT gameweek, total_points, minutes, goals_scored, assists, clean_sheets, bonus_points
+        SELECT gameweek, total_points, minutes, goals_scored, assists, clean_sheets, bonus_points,
+               starts, selected, transfers_balance, value
         FROM player_history
         WHERE player_id = ? AND gameweek < ?
         ORDER BY gameweek DESC
@@ -144,6 +156,10 @@ def get_player_history(
             "assists": r["assists"],
             "clean_sheets": r["clean_sheets"],
             "bonus": r["bonus_points"],
+            "starts": r["starts"],
+            "selected": r["selected"],
+            "transfers_balance": r["transfers_balance"],
+            "value": r["value"],
         }
         for r in rows
     ]
@@ -198,7 +214,7 @@ def get_fixture_difficulty(player_id: int, gw: int) -> int:
     return int(round(float(sum(diffs)) / len(diffs)))
 
 
-def _estimate_expected_minutes(player: dict, history: List[Dict]) -> float:
+def _estimate_expected_minutes(player: dict, history: List[Dict], cfg: Dict[str, float]) -> float:
     status = player.get("status")
     if status in ("i", "o", "s"):
         return 0.0
@@ -221,6 +237,16 @@ def _estimate_expected_minutes(player: dict, history: List[Dict]) -> float:
         high_minutes_games = [m for m in recent_minutes if m >= 70]
         if len(high_minutes_games) >= 3:
             base_minutes = max(base_minutes, 75.0)
+
+    starts_recent = [h["starts"] for h in history if h.get("starts") is not None]
+    if starts_recent:
+        start_rate = float(np.mean([1.0 if s else 0.0 for s in starts_recent]))
+        start_mult = _clamp(
+            0.75 + 0.35 * start_rate,
+            float(cfg.get("start_rate_minutes_floor", 0.65)),
+            float(cfg.get("start_rate_minutes_cap", 1.08)),
+        )
+        base_minutes *= start_mult
 
     return min(base_minutes, 90.0)
 
@@ -261,6 +287,25 @@ def _safe_float(value: Optional[float], default: float = 0.0) -> float:
         return default
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _get_max_history_gw() -> int:
+    global _MAX_HISTORY_GW_CACHE
+    if _MAX_HISTORY_GW_CACHE is not None:
+        return _MAX_HISTORY_GW_CACHE
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT MAX(gameweek) AS max_gw FROM player_history")
+    row = c.fetchone()
+    conn.close()
+    _MAX_HISTORY_GW_CACHE = int(row["max_gw"] or 0)
+    return _MAX_HISTORY_GW_CACHE
+
+
 def get_player_position(player_id: int) -> str:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -293,7 +338,7 @@ def predict_player_points(
     history_recent = history_all[:int(cfg.get("history_recent_n", 6))]
 
     # Expected minutes for upcoming GW
-    exp_minutes = _estimate_expected_minutes(p, history_recent)
+    exp_minutes = _estimate_expected_minutes(p, history_recent, cfg)
 
     # Base EP components (per full match)
     season_points = [float(h["points"]) for h in history_all if h.get("points") is not None]
@@ -334,6 +379,56 @@ def predict_player_points(
     }
     xgi_trust = min(1.0, n_games / 8.0)
     base_ep += xgi90 * xgi_weight.get(pos, 0.05) * xgi_trust
+
+    # Market and price signals (time-sliced from historical GW rows).
+    transfer_ratios = []
+    for h in history_recent:
+        selected = h.get("selected")
+        balance = h.get("transfers_balance")
+        if selected is None or balance is None:
+            continue
+        sel = float(selected)
+        if sel <= 0:
+            continue
+        transfer_ratios.append(float(balance) / sel)
+    if transfer_ratios:
+        transfer_signal = _weighted_mean(
+            transfer_ratios,
+            decay=float(cfg.get("recent_decay", 0.83)),
+        )
+        transfer_adj = _clamp(
+            transfer_signal * float(cfg.get("transfer_balance_scale", 4.0)),
+            -float(cfg.get("transfer_balance_cap", 0.08)),
+            float(cfg.get("transfer_balance_cap", 0.08)),
+        )
+        base_ep *= 1.0 + transfer_adj
+
+    selected_series = [h.get("selected") for h in history_recent if h.get("selected") is not None]
+    if len(selected_series) >= 3 and float(selected_series[-1]) > 0:
+        selected_trend = (float(selected_series[0]) - float(selected_series[-1])) / float(selected_series[-1])
+        selected_adj = _clamp(
+            selected_trend * float(cfg.get("selected_trend_scale", 0.25)),
+            -float(cfg.get("selected_trend_cap", 0.08)),
+            float(cfg.get("selected_trend_cap", 0.08)),
+        )
+        base_ep *= 1.0 + selected_adj
+
+    value_series = [h.get("value") for h in history_recent if h.get("value") is not None]
+    if len(value_series) >= 3:
+        value_delta = float(value_series[0]) - float(value_series[-1])
+        value_adj = _clamp(
+            value_delta * float(cfg.get("value_delta_scale", 0.015)),
+            -float(cfg.get("value_delta_cap", 0.10)),
+            float(cfg.get("value_delta_cap", 0.10)),
+        )
+        base_ep *= 1.0 + value_adj
+
+    # Use official ep_next only for true future GWs to avoid historical leakage.
+    if gw > _get_max_history_gw():
+        ep_next = _safe_float(p.get("ep_next"), 0.0)
+        if ep_next > 0:
+            w_ep = _clamp(float(cfg.get("ep_next_weight_future", 0.08)), 0.0, 0.5)
+            base_ep = (1.0 - w_ep) * base_ep + w_ep * ep_next
 
     # Expand premium attacker ceiling without inflating low-sample outliers.
     starts = _safe_float(p.get("starts"), 0.0)
