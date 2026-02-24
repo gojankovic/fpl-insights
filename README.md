@@ -96,7 +96,13 @@ With Monte Carlo baseline:
 python ai.py h2h --teamA <id> --teamB <id> --gw <gw> --mc
 
 ### Top players dashboard (predicted points)
-python predictions/predict_players.py --gw <gw> --top 10 --sims 5000
+python predictions/predict_players.py --gw <gw> --top 10
+
+Range view (example GW28-GW35):
+python predictions/predict_players.py --gw-from 28 --gw-to 35 --top 10 --pool 250
+
+Backtest predicted vs actual:
+python predictions/backtest_player_model.py --gw-from 20 --gw-to 27
 
 ## Notes
 

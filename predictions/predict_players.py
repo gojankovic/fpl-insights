@@ -3,7 +3,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
-import numpy as np
 from rich.console import Console
 from rich.table import Table
 
@@ -18,59 +17,39 @@ def _position_label(element_type: int | None) -> str:
     return {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}.get(element_type, "?")
 
 
-def _fixture_count_map(gw: int) -> Dict[int, int]:
+def _opponents_map(gw: int) -> Dict[int, List[str]]:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT team_h AS team_id, COUNT(*) AS cnt
-        FROM fixtures
-        WHERE event = ?
-        GROUP BY team_h
+        SELECT f.team_h,
+               f.team_a,
+               f.difficulty_home,
+               f.difficulty_away,
+               th.short_name AS team_h_name,
+               ta.short_name AS team_a_name
+        FROM fixtures f
+        JOIN teams th ON th.id = f.team_h
+        JOIN teams ta ON ta.id = f.team_a
+        WHERE f.event = ?
         """,
         (gw,),
     )
-    team_h_rows = cur.fetchall()
-
-    cur.execute(
-        """
-        SELECT team_a AS team_id, COUNT(*) AS cnt
-        FROM fixtures
-        WHERE event = ?
-        GROUP BY team_a
-        """,
-        (gw,),
-    )
-    team_a_rows = cur.fetchall()
+    rows = cur.fetchall()
     conn.close()
 
-    counts: Dict[int, int] = {}
-    for r in team_h_rows:
-        counts[r["team_id"]] = counts.get(r["team_id"], 0) + int(r["cnt"])
-    for r in team_a_rows:
-        counts[r["team_id"]] = counts.get(r["team_id"], 0) + int(r["cnt"])
-    return counts
+    out: Dict[int, List[str]] = {}
+    for r in rows:
+        home_team = r["team_h"]
+        away_team = r["team_a"]
+        home_opp = f"{r['team_a_name']}(H,d{r['difficulty_home']})"
+        away_opp = f"{r['team_h_name']}(A,d{r['difficulty_away']})"
+        out.setdefault(home_team, []).append(home_opp)
+        out.setdefault(away_team, []).append(away_opp)
+    return out
 
 
-def _simulate_player_distribution(mean: float, std: float, n_sims: int) -> Dict[str, float]:
-    if mean <= 0:
-        return {"expected": 0.0, "p75": 0.0, "p90": 0.0}
-
-    samples = np.random.normal(loc=mean, scale=max(std, 0.0), size=n_sims)
-    samples = np.clip(samples, 0, None)
-    return {
-        "expected": float(np.mean(samples)),
-        "p75": float(np.percentile(samples, 75)),
-        "p90": float(np.percentile(samples, 90)),
-    }
-
-
-def top_players_by_prediction(
-    gw: int,
-    top_n: int = 10,
-    n_sims: int = 5000,
-    include_unavailable: bool = False,
-) -> List[Dict[str, Any]]:
+def _player_pool(include_unavailable: bool, pool_size: int) -> List[Any]:
     conn = get_connection()
     cur = conn.cursor()
 
@@ -81,68 +60,90 @@ def top_players_by_prediction(
                p.team_id,
                p.element_type,
                p.status,
+               p.total_points,
                t.short_name AS team
         FROM players p
         LEFT JOIN teams t ON p.team_id = t.id
     """
     if not include_unavailable:
         query += " WHERE p.status NOT IN ('i', 's', 'u', 'o')"
+    query += " ORDER BY p.total_points DESC LIMIT ?"
 
-    cur.execute(query)
-    players = cur.fetchall()
+    cur.execute(query, (pool_size,))
+    rows = cur.fetchall()
     conn.close()
-    fixture_counts = _fixture_count_map(gw)
+    return rows
+
+
+def top_players_by_prediction_range(
+    gw_from: int,
+    gw_to: int,
+    top_n: int = 10,
+    include_unavailable: bool = False,
+    pool_size: int = 250,
+) -> List[Dict[str, Any]]:
+    gws = list(range(gw_from, gw_to + 1))
+    opponents_by_gw = {gw: _opponents_map(gw) for gw in gws}
+    players = _player_pool(include_unavailable=include_unavailable, pool_size=pool_size)
 
     out: List[Dict[str, Any]] = []
     for row in players:
-        pid = row["id"]
-        mean, std = predict_player_points(pid, gw)
-        fixtures = fixture_counts.get(row["team_id"], 0)
-        dist = _simulate_player_distribution(mean, std, n_sims=n_sims)
+        per_gw: List[Dict[str, Any]] = []
+        total = 0.0
+        for gw in gws:
+            mean, _ = predict_player_points(row["id"], gw)
+            opps = opponents_by_gw[gw].get(row["team_id"], ["BLANK"])
+            per_gw.append(
+                {
+                    "gw": gw,
+                    "points": float(mean),
+                    "opponents": opps,
+                }
+            )
+            total += float(mean)
 
         out.append(
             {
-                "id": pid,
+                "id": row["id"],
                 "name": f"{row['first_name']} {row['second_name']}".strip(),
                 "team": row["team"],
                 "pos": _position_label(row["element_type"]),
                 "status": row["status"],
-                "fixtures": fixtures,
-                "predicted_points": float(mean),
-                "expected_points_mc": dist["expected"],
-                "p75_mc": dist["p75"],
-                "p90_mc": dist["p90"],
+                "predicted_total": total,
+                "per_gw": per_gw,
             }
         )
 
-    ranked = sorted(out, key=lambda x: x["expected_points_mc"], reverse=True)
+    ranked = sorted(out, key=lambda x: x["predicted_total"], reverse=True)
     return ranked[:top_n]
 
 
-def render_dashboard(rows: List[Dict[str, Any]], gw: int) -> None:
+def render_dashboard(rows: List[Dict[str, Any]], gw_from: int, gw_to: int) -> None:
+    gws = list(range(gw_from, gw_to + 1))
     console = Console()
-    table = Table(title=f"Top Predicted Players for GW{gw}")
+    title = f"Top Predicted Players GW{gw_from}" if gw_from == gw_to else f"Top Predicted Players GW{gw_from}-GW{gw_to}"
+    table = Table(title=title)
     table.add_column("#", justify="right")
     table.add_column("Player")
     table.add_column("Team")
     table.add_column("Pos", justify="center")
-    table.add_column("Fx", justify="right")
-    table.add_column("Mean", justify="right")
-    table.add_column("MC Exp", justify="right")
-    table.add_column("P75", justify="right")
-    table.add_column("P90", justify="right")
+    table.add_column("Pred Total", justify="right")
+    for gw in gws:
+        table.add_column(f"GW{gw}", justify="left")
 
     for i, p in enumerate(rows, start=1):
+        gw_cells = []
+        for item in p["per_gw"]:
+            opp = "/".join(item["opponents"])
+            gw_cells.append(f"{item['points']:.1f} {opp}")
+
         table.add_row(
             str(i),
             p["name"],
             p["team"] or "-",
             p["pos"],
-            str(p["fixtures"]),
-            f"{p['predicted_points']:.2f}",
-            f"{p['expected_points_mc']:.2f}",
-            f"{p['p75_mc']:.2f}",
-            f"{p['p90_mc']:.2f}",
+            f"{p['predicted_total']:.2f}",
+            *gw_cells,
         )
 
     console.print(table)
@@ -150,11 +151,13 @@ def render_dashboard(rows: List[Dict[str, Any]], gw: int) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Player prediction dashboard (Top N for target GW)."
+        description="Player prediction dashboard in terminal (single GW or GW range)."
     )
-    parser.add_argument("--gw", type=int, required=True, help="Target gameweek")
+    parser.add_argument("--gw", type=int, help="Single target gameweek")
+    parser.add_argument("--gw-from", type=int, help="Start GW for range")
+    parser.add_argument("--gw-to", type=int, help="End GW for range")
     parser.add_argument("--top", type=int, default=10, help="Number of players to show")
-    parser.add_argument("--sims", type=int, default=5000, help="Monte Carlo simulations")
+    parser.add_argument("--pool", type=int, default=250, help="Player pool size to rank from")
     parser.add_argument(
         "--include-unavailable",
         action="store_true",
@@ -162,13 +165,26 @@ def main():
     )
 
     args = parser.parse_args()
-    rows = top_players_by_prediction(
-        gw=args.gw,
+    if args.gw is None and (args.gw_from is None or args.gw_to is None):
+        parser.error("Provide either --gw OR both --gw-from and --gw-to.")
+
+    if args.gw is not None:
+        gw_from = args.gw
+        gw_to = args.gw
+    else:
+        gw_from = args.gw_from
+        gw_to = args.gw_to
+        if gw_to < gw_from:
+            parser.error("--gw-to must be >= --gw-from.")
+
+    rows = top_players_by_prediction_range(
+        gw_from=gw_from,
+        gw_to=gw_to,
         top_n=args.top,
-        n_sims=args.sims,
         include_unavailable=args.include_unavailable,
+        pool_size=args.pool,
     )
-    render_dashboard(rows, gw=args.gw)
+    render_dashboard(rows=rows, gw_from=gw_from, gw_to=gw_to)
 
 
 if __name__ == "__main__":

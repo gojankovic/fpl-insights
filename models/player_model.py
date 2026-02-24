@@ -1,5 +1,5 @@
 import sqlite3
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 
 import numpy as np
 
@@ -40,25 +40,43 @@ def get_player_history_points(player_id: int, last_n: int = 5) -> list:
     return rows
 
 
-def get_player_history(player_id: int, last_n: int = 5) -> List[Dict]:
+def get_player_history(
+    player_id: int,
+    last_n: int = 5,
+    up_to_gw: Optional[int] = None,
+) -> List[Dict]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
 
-    c.execute("""
-        SELECT total_points, minutes
+    if up_to_gw is None:
+        c.execute("""
+        SELECT gameweek, total_points, minutes, goals_scored, assists, clean_sheets, bonus_points
         FROM player_history
         WHERE player_id = ?
         ORDER BY gameweek DESC
         LIMIT ?
     """, (player_id, last_n))
+    else:
+        c.execute("""
+        SELECT gameweek, total_points, minutes, goals_scored, assists, clean_sheets, bonus_points
+        FROM player_history
+        WHERE player_id = ? AND gameweek < ?
+        ORDER BY gameweek DESC
+        LIMIT ?
+    """, (player_id, up_to_gw, last_n))
 
     rows = c.fetchall()
     conn.close()
     return [
         {
+            "gw": r["gameweek"],
             "points": r["total_points"],
             "minutes": r["minutes"],
+            "goals": r["goals_scored"],
+            "assists": r["assists"],
+            "clean_sheets": r["clean_sheets"],
+            "bonus": r["bonus_points"],
         }
         for r in rows
     ]
@@ -120,7 +138,8 @@ def _estimate_expected_minutes(player: dict, history: List[Dict]) -> float:
 
     recent_minutes = [h["minutes"] for h in history if h.get("minutes") is not None]
     if recent_minutes:
-        base_minutes = float(sum(recent_minutes)) / len(recent_minutes)
+        # Robust center: median is less sensitive to cameo outliers.
+        base_minutes = float(np.median(recent_minutes))
     else:
         base_minutes = 80.0 if (player.get("starts") or 0) >= 3 else 60.0
 
@@ -128,7 +147,25 @@ def _estimate_expected_minutes(player: dict, history: List[Dict]) -> float:
     if chance is not None:
         base_minutes *= max(0.0, min(float(chance), 100.0)) / 100.0
 
+    # Keep a reasonable floor for consistently starting players.
+    starts = int(player.get("starts") or 0)
+    chance_pct = 100.0 if chance is None else max(0.0, min(float(chance), 100.0))
+    if starts >= 10 and chance_pct >= 75:
+        high_minutes_games = [m for m in recent_minutes if m >= 70]
+        if len(high_minutes_games) >= 3:
+            base_minutes = max(base_minutes, 75.0)
+
     return min(base_minutes, 90.0)
+
+
+def _weighted_mean(values: List[float], decay: float = 0.85) -> float:
+    if not values:
+        return 0.0
+    weights = [decay ** i for i in range(len(values))]
+    den = float(sum(weights))
+    if den <= 0:
+        return float(sum(values)) / len(values)
+    return float(sum(v * w for v, w in zip(values, weights))) / den
 
 
 def _xgi_per90(player: dict) -> float:
@@ -166,26 +203,38 @@ def predict_player_points(player_id: int, gw: int) -> Tuple[float, float]:
     Returns (mean, std) points expectation for player in a given GW.
     """
     p = get_player_data(player_id)
-    history = get_player_history(player_id, last_n=5)
+    # Time-sliced history: for GW X, use only data up to GW X-1.
+    history_all = get_player_history(player_id, last_n=60, up_to_gw=gw)
+    history_recent = history_all[:6]
 
     # Expected minutes for upcoming GW
-    exp_minutes = _estimate_expected_minutes(p, history)
+    exp_minutes = _estimate_expected_minutes(p, history_recent)
 
     # Base EP components (per full match)
-    season_ppg = p.get("points_per_game") or 0.0
-    recent_ppg = (
-        float(sum(h["points"] for h in history)) / len(history)
-        if history
-        else season_ppg
-    )
-    form = p.get("form") or season_ppg
+    season_points = [float(h["points"]) for h in history_all if h.get("points") is not None]
+    recent_points = [float(h["points"]) for h in history_recent if h.get("points") is not None]
 
-    base_ep = 0.45 * season_ppg + 0.35 * recent_ppg + 0.2 * form
+    season_ppg_asof = (
+        float(sum(season_points)) / len(season_points)
+        if season_points else float(p.get("points_per_game") or 0.0)
+    )
+    recent_ppg = _weighted_mean(recent_points, decay=0.83) if recent_points else season_ppg_asof
+    anchor_ppg = float(p.get("points_per_game") or season_ppg_asof)
+
+    # Blend season signal + recent trend with a light anchor to bootstrap.
+    raw_ep = 0.55 * season_ppg_asof + 0.30 * recent_ppg + 0.15 * anchor_ppg
+
+    # Bayesian-style shrinkage toward position prior for stability.
+    pos = _position(p)
+    pos_prior = {"GK": 3.4, "DEF": 3.8, "MID": 4.9, "FWD": 5.2}
+    n_games = len(season_points)
+    shrink = n_games / (n_games + 10.0)
+    base_ep = shrink * raw_ep + (1.0 - shrink) * pos_prior.get(pos, 4.5)
 
     # xGI bonus scaled by position
-    pos = _position(p)
-    xgi_weight = {"GK": 0.02, "DEF": 0.05, "MID": 0.10, "FWD": 0.12}
-    base_ep += _xgi_per90(p) * xgi_weight.get(pos, 0.08)
+    xgi_weight = {"GK": 0.00, "DEF": 0.02, "MID": 0.05, "FWD": 0.08}
+    xgi_trust = min(1.0, n_games / 8.0)
+    base_ep += _xgi_per90(p) * xgi_weight.get(pos, 0.05) * xgi_trust
 
     # Fixture adjustment (supports DGW)
     difficulties = get_player_fixtures_in_gw(player_id, gw)
@@ -194,16 +243,19 @@ def predict_player_points(player_id: int, gw: int) -> Tuple[float, float]:
 
     minutes_per_fixture = exp_minutes
     if len(difficulties) > 1:
-        minutes_per_fixture = exp_minutes * 0.85
+        minutes_per_fixture = exp_minutes * 0.82
     minutes_factor = min(minutes_per_fixture, 90.0) / 90.0
 
     ep_total = 0.0
+    # Stronger fixture impact so opponent quality matters more.
+    fixture_weight_by_pos = {"GK": 0.12, "DEF": 0.16, "MID": 0.20, "FWD": 0.24}
+    fixture_weight = fixture_weight_by_pos.get(pos, 0.18)
     for difficulty in difficulties:
-        adj = 1 + (3 - difficulty) * 0.1
+        adj = 1 + (3 - difficulty) * fixture_weight
         ep_total += base_ep * minutes_factor * adj
 
     # STD from history
-    points_history = [h["points"] for h in history if h.get("points") is not None]
+    points_history = [h["points"] for h in history_recent if h.get("points") is not None]
     if len(points_history) >= 3:
         std = float(np.std(points_history))
     else:
@@ -213,4 +265,4 @@ def predict_player_points(player_id: int, gw: int) -> Tuple[float, float]:
     pos_std_mult = {"GK": 0.75, "DEF": 0.85, "MID": 1.0, "FWD": 1.1}
     std *= pos_std_mult.get(pos, 1.0)
 
-    return ep_total, std
+    return max(ep_total, 0.0), max(std, 0.5)
