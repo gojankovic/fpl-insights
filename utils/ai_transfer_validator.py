@@ -42,6 +42,8 @@ def validate_transfer_suggestion(
 
     if out_id is None or in_id is None:
         return False, "out_id or in_id is missing."
+    if out_id == in_id:
+        return False, "out_id and in_id cannot be the same player."
 
     out_player = _find_in_squad(squad_state, out_id)
     if out_player is None:
@@ -87,10 +89,69 @@ def validate_transfer_suggestion(
 
     if out_price is None or in_price is None:
         return False, "Missing price information for players."
+    try:
+        out_price = float(out_price)
+        in_price = float(in_price)
+    except (TypeError, ValueError):
+        return False, "Invalid numeric values for player prices."
 
     if in_price > out_price + bank + 1e-6:
         return False, (
             f"Not enough budget: {in_price} > {out_price} + bank({bank})."
         )
 
+    return True, "OK"
+
+
+def apply_transfer_suggestion(
+    squad_state: Dict[str, Any],
+    suggestion: Dict[str, Any],
+    candidate_pool: List[Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """
+    Apply a previously validated transfer to squad_state in-place.
+    This lets callers validate multi-transfer sequences correctly.
+    """
+    out_id = suggestion.get("out_id")
+    in_id = suggestion.get("in_id")
+
+    out_idx = None
+    for i, p in enumerate(squad_state["squad"]):
+        if p["id"] == out_id:
+            out_idx = i
+            break
+    if out_idx is None:
+        return False, f"Outgoing player {out_id} is not in squad."
+
+    out_player = squad_state["squad"][out_idx]
+    in_player = _find_in_pool(candidate_pool, in_id)
+    if in_player is None:
+        return False, f"Incoming player {in_id} not found in candidate pool."
+
+    out_price = float(out_player.get("price", 0.0))
+    in_price = float(in_player.get("price", 0.0))
+    squad_state["bank"] = float(squad_state.get("bank", 0.0)) + out_price - in_price
+
+    out_team = out_player.get("team")
+    in_team = in_player.get("team")
+    club_counts = squad_state.setdefault("club_counts", {})
+    if out_team is not None:
+        club_counts[out_team] = max(0, club_counts.get(out_team, 0) - 1)
+    if in_team is not None:
+        club_counts[in_team] = club_counts.get(in_team, 0) + 1
+
+    squad_state["squad"][out_idx] = {
+        "id": in_player.get("id"),
+        "name": in_player.get("name"),
+        "team": in_player.get("team"),
+        "pos": in_player.get("pos"),
+        "price": in_player.get("price"),
+        "status": in_player.get("status"),
+        "chance_of_playing_next_round": in_player.get("chance_of_playing_next_round"),
+        "injury": in_player.get("injury", in_player.get("status") == "i"),
+        "suspended": in_player.get("suspended", in_player.get("status") == "s"),
+        "rotation_risk": in_player.get("rotation_risk", "unknown"),
+        "expected_minutes": in_player.get("expected_minutes", 0),
+        "recent_form": in_player.get("recent_form", in_player.get("form_last3", 0.0)),
+    }
     return True, "OK"

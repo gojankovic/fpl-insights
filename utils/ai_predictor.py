@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -10,12 +10,24 @@ from openai import OpenAI
 # -------------------------------------------------
 
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client: Optional[OpenAI] = None
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY in .env file")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+def _get_openai_client() -> Tuple[Optional[OpenAI], Optional[str]]:
+    global client
+    if client is not None:
+        return client, None
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None, "Missing OPENAI_API_KEY in .env file"
+
+    try:
+        client = OpenAI(api_key=api_key)
+    except Exception as e:
+        return None, f"OpenAI client init error: {e}"
+
+    return client, None
 
 
 # -------------------------------------------------
@@ -33,8 +45,12 @@ def ask_llm(prompt: str) -> Dict[str, Any]:
         "error": error_message_or_None
       }
     """
+    client_obj, client_error = _get_openai_client()
+    if client_error:
+        return {"raw": None, "json": None, "error": client_error}
+
     try:
-        response = client.chat.completions.create(
+        response = client_obj.chat.completions.create(
             model="gpt-5-mini",
             response_format={"type": "json_object"},
             messages=[
